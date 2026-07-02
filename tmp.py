@@ -3,8 +3,9 @@ import os
 
 host = "https://clob.polymarket.com"
 chain = 137  # Polygon mainnet
-private_key = '019f1d32-4a3f-759f-a907-c1268bd7c5c5'
-address = '0x18d26a47e4f9f976432ca7f301670c1e86f28c02'
+private_key = os.getenv("PRIVATE_KEY")
+address = '0x9A8BE095b57163132959A5D054e4F90BE76c015D'
+print(private_key)
 # Derive API credentials (L1 → L2 auth)
 temp_client = ClobClient(host, key=private_key, chain_id=chain)
 api_creds = temp_client.create_or_derive_api_key()
