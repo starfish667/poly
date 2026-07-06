@@ -1,0 +1,47 @@
+[
+  {
+    "name": "Unity Bancorp EPS",
+    "strategy": "earnings",
+    "url": "https://polymarket.com/market/unty-quarterly-earnings-gaap-eps-07-14-2026-1pt44",
+    "limit_price": "0.99",
+    "size": "5",
+    "interval": 15,
+    "active_interval": 3,
+    "active_from_utc": "2026-07-13T12:00:00Z",
+    "active_until_utc": "2026-07-15T12:00:00Z"
+  },
+  {
+    "name": "Conagra EPS",
+    "strategy": "earnings",
+    "url": "https://polymarket.com/market/cag-quarterly-earnings-nongaap-eps-07-15-2026-0pt46",
+    "limit_price": "0.99",
+    "size": "5",
+    "interval": 15,
+    "active_interval": 3,
+    "active_from_utc": "2026-07-14T12:00:00Z",
+    "active_until_utc": "2026-07-16T12:00:00Z"
+  },
+  {
+    "name": "PNC EPS",
+    "strategy": "earnings",
+    "url": "https://polymarket.com/market/pnc-quarterly-earnings-gaap-eps-07-15-2026-4pt41",
+    "limit_price": "0.99",
+    "size": "5",
+    "interval": 15,
+    "active_interval": 3,
+    "active_from_utc": "2026-07-14T12:00:00Z",
+    "active_until_utc": "2026-07-16T12:00:00Z"
+  },
+  {
+    "name": "Guangzhou July 6 Temperature Event",
+    "strategy": "weather",
+    "url": "https://polymarket.com/event/highest-temperature-in-guangzhou-on-july-6-2026",
+    "limit_price": "0.99",
+    "max_entry_price": "0.99",
+    "size": "5",
+    "interval": 15,
+    "active_interval": 3,
+    "active_from_utc": "2026-07-05T16:00:00Z",
+    "active_until_utc": "2026-07-06T18:00:00Z"
+  }
+]

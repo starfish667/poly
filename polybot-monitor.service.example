@@ -1,0 +1,17 @@
+[Unit]
+Description=Polymarket event monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/polymarket
+EnvironmentFile=/opt/polymarket/.env
+Environment=PYTHONUNBUFFERED=1
+Environment=POLYBOT_ENABLE_LIVE=1
+ExecStart=/opt/polymarket/.venv/bin/python -u monitor.py --watchlist watchlist.json --interval 15 --active-interval 3 --max-concurrency 4 --live
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
