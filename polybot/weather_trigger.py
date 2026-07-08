@@ -419,7 +419,7 @@ async def choose_weather_source(
     if requested == "ecmwf":
         raise RuntimeError(
             "ECMWF open data is forecast data, not live observed station highs; "
-            "this trigger bot requires observed METAR temperatures."
+            "this trigger bot requires observed station history."
         )
 
     sample_ids = station_ids[: min(len(station_ids), 6)] or ["EGLL"]
@@ -438,16 +438,17 @@ async def choose_weather_source(
         ecmwf_latency = await benchmark_get(ECMWF_OPEN_DATA_URL)
 
     reason = (
-        "AviationWeather selected because it provides live observed METAR station "
-        "temperatures; ECMWF open data is forecast-only for this use case."
+        "Weather.com/Wunderground history API is primary because it gives finer "
+        "Celsius trigger precision via Fahrenheit observations; AviationWeather "
+        "METAR is the fallback. ECMWF open data is forecast-only for this use case."
     )
     if aviation_latency is not None:
-        reason += f" AviationWeather benchmark latency={aviation_latency:.3f}s."
+        reason += f" AviationWeather fallback benchmark latency={aviation_latency:.3f}s."
     if ecmwf_latency is not None:
         reason += f" ECMWF endpoint benchmark latency={ecmwf_latency:.3f}s but is not eligible."
 
     return WeatherSourceDecision(
-        name="aviationweather",
+        name="weather.com-history+aviationweather-fallback",
         latency_seconds=aviation_latency,
         min_interval_seconds=max(0.1, poll_interval),
         reason=reason,
