@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import re
 import sys
 import time
 from dataclasses import dataclass
@@ -66,7 +67,14 @@ class WatchItem:
 class ProcessOutcome:
     item: WatchItem
     accepted: int
+    state_changed: bool
     notes: list[str]
+
+
+@dataclass
+class MonitorState:
+    fired: set[str]
+    observed_maxima: dict[str, Decimal]
 
 
 def utc_now() -> str:
@@ -162,25 +170,38 @@ def load_watchlist(
     return items
 
 
-def load_state(path: Path) -> set[str]:
+def load_state(path: Path) -> MonitorState:
     if not path.exists():
-        return set()
+        return MonitorState(fired=set(), observed_maxima={})
     try:
         raw = json.loads(path.read_text(encoding="utf-8-sig"))
     except json.JSONDecodeError:
-        return set()
+        return MonitorState(fired=set(), observed_maxima={})
     if not isinstance(raw, dict):
-        return set()
+        return MonitorState(fired=set(), observed_maxima={})
     fired = raw.get("fired")
-    if not isinstance(fired, list):
-        return set()
-    return {str(item) for item in fired}
+    observed_maxima = raw.get("observed_maxima")
+    return MonitorState(
+        fired={str(item) for item in fired} if isinstance(fired, list) else set(),
+        observed_maxima=(
+            {
+                str(key): Decimal(str(value))
+                for key, value in observed_maxima.items()
+            }
+            if isinstance(observed_maxima, dict)
+            else {}
+        ),
+    )
 
 
-def save_state(path: Path, fired: set[str]) -> None:
+def save_state(path: Path, state: MonitorState) -> None:
     payload: dict[str, Any] = {
         "updated_at": utc_now(),
-        "fired": sorted(fired),
+        "fired": sorted(state.fired),
+        "observed_maxima": {
+            key: str(value)
+            for key, value in sorted(state.observed_maxima.items())
+        },
     }
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
@@ -191,6 +212,71 @@ def signal_key(signal: Signal) -> str:
 
 def signal_token_id(signal: Signal) -> str | None:
     return signal.market.yes_token_id if signal.outcome == "YES" else signal.market.no_token_id
+
+
+OBSERVED_VALUE_RE = re.compile(r"^\s*(-?\d+(?:\.\d+)?)\s*([CF])\s*$", re.IGNORECASE)
+
+
+def observed_temperature(signal: Signal, item_url: str) -> tuple[str, Decimal, str] | None:
+    if signal.observed_value is None:
+        return None
+    match = OBSERVED_VALUE_RE.match(signal.observed_value)
+    if not match:
+        return None
+    value = Decimal(match.group(1))
+    unit = match.group(2).upper()
+    return f"{item_url}|{unit}", value, unit
+
+
+def filter_temperature_increases(
+    signals: list[Signal],
+    *,
+    item_url: str,
+    observed_maxima: dict[str, Decimal],
+) -> tuple[list[Signal], list[str], bool]:
+    passthrough: list[Signal] = []
+    grouped: dict[str, list[Signal]] = {}
+    grouped_values: dict[str, tuple[Decimal, str]] = {}
+
+    for signal in signals:
+        observed = observed_temperature(signal, item_url)
+        if observed is None:
+            passthrough.append(signal)
+            continue
+        key, value, unit = observed
+        grouped.setdefault(key, []).append(signal)
+        old_value = grouped_values.get(key)
+        if old_value is None or value > old_value[0]:
+            grouped_values[key] = (value, unit)
+
+    filtered = list(passthrough)
+    notes: list[str] = []
+    state_changed = False
+    for key, grouped_signals in grouped.items():
+        value, unit = grouped_values[key]
+        previous = observed_maxima.get(key)
+        if previous is None:
+            observed_maxima[key] = value
+            state_changed = True
+            notes.append(
+                f"  temperature baseline: rounded max {value}{unit}; "
+                "waiting for a higher max before triggering"
+            )
+            continue
+        if value <= previous:
+            notes.append(
+                f"  no temperature increase: rounded max {value}{unit} "
+                f"<= previous {previous}{unit}"
+            )
+            continue
+        observed_maxima[key] = value
+        state_changed = True
+        notes.append(
+            f"  temperature increase: rounded max {previous}{unit} -> {value}{unit}"
+        )
+        filtered.extend(grouped_signals)
+
+    return filtered, notes, state_changed
 
 
 def websocket_price_lookup(price_cache: PriceWebSocketCache):
@@ -226,12 +312,18 @@ async def process_item(
     live: bool,
     include_no: bool,
     fired: set[str],
+    observed_maxima: dict[str, Decimal],
     price_cache: PriceWebSocketCache | None = None,
-) -> tuple[int, list[str]]:
+) -> tuple[int, bool, list[str]]:
     started_at = time.perf_counter()
     notes: list[str] = []
     signals, timing = await collect_signals_timed(item.url, item.strategy)
     collected_at = time.perf_counter()
+    signals, temperature_notes, state_changed = filter_temperature_increases(
+        signals,
+        item_url=item.url,
+        observed_maxima=observed_maxima,
+    )
     fresh = [signal for signal in signals if signal_key(signal) not in fired]
     timing_text = (
         f"polymarket={timing.polymarket_seconds:.3f}s "
@@ -244,12 +336,14 @@ async def process_item(
             f"[{utc_now()}] {item.name}: no fresh signal "
             f"({timing_text} total={time.perf_counter() - started_at:.3f}s)"
         )
-        return 0, notes
+        notes.extend(temperature_notes)
+        return 0, state_changed, notes
 
     notes.append(
         f"[{utc_now()}] {item.name}: {len(fresh)} fresh signal(s) "
         f"({timing_text})"
     )
+    notes.extend(temperature_notes)
     for signal in fresh:
         notes.append(f"  {signal.outcome} {signal.market.question}")
         notes.append(f"  {signal.reason}")
@@ -273,7 +367,7 @@ async def process_item(
     )
     if not plans:
         notes.append(f"  no trade plans after filters (total={time.perf_counter() - started_at:.3f}s)")
-        return 0, notes
+        return 0, state_changed, notes
 
     execute_started_at = time.perf_counter()
     results = await execute_plans(plans, live=live)
@@ -301,7 +395,7 @@ async def process_item(
         f"execute={executed_at - execute_started_at:.3f}s "
         f"total={executed_at - started_at:.3f}s"
     )
-    return accepted, notes
+    return accepted, state_changed, notes
 
 
 async def safe_process_item(
@@ -310,29 +404,38 @@ async def safe_process_item(
     live: bool,
     include_no: bool,
     fired: set[str],
+    observed_maxima: dict[str, Decimal],
     semaphore: asyncio.Semaphore,
     price_cache: PriceWebSocketCache | None = None,
 ) -> ProcessOutcome:
     async with semaphore:
         try:
-            accepted, notes = await process_item(
+            accepted, state_changed, notes = await process_item(
                 item,
                 live=live,
                 include_no=include_no,
                 fired=fired,
+                observed_maxima=observed_maxima,
                 price_cache=price_cache,
             )
-            return ProcessOutcome(item=item, accepted=accepted, notes=notes)
+            return ProcessOutcome(
+                item=item,
+                accepted=accepted,
+                state_changed=state_changed,
+                notes=notes,
+            )
         except (httpx.HTTPStatusError, httpx.TransportError, TransportError) as error:
             return ProcessOutcome(
                 item=item,
                 accepted=0,
+                state_changed=False,
                 notes=[f"[{utc_now()}] {item.name}: transient network issue: {error}"],
             )
         except Exception as error:  # keep the monitor alive
             return ProcessOutcome(
                 item=item,
                 accepted=0,
+                state_changed=False,
                 notes=[f"[{utc_now()}] {item.name}: ERROR {type(error).__name__}: {error}"],
             )
 
@@ -340,7 +443,7 @@ async def safe_process_item(
 async def run_monitor(args: argparse.Namespace) -> None:
     watchlist_path = Path(args.watchlist)
     state_path = Path(args.state)
-    fired = load_state(state_path)
+    state = load_state(state_path)
     session_seen: set[str] = set()
     next_due: dict[str, datetime] = {}
     semaphore = asyncio.Semaphore(args.max_concurrency)
@@ -398,9 +501,10 @@ async def run_monitor(args: argparse.Namespace) -> None:
                 f"[{utc_now()}] cycle start: {len(due_items)}/{len(items)} due, "
                 f"active={active_count}, live={args.live}"
             )
-            cycle_fired = set(fired)
+            cycle_fired = set(state.fired)
             if not args.live:
                 cycle_fired |= session_seen
+            cycle_observed_maxima = dict(state.observed_maxima)
 
             outcomes = await asyncio.gather(
                 *(
@@ -409,6 +513,7 @@ async def run_monitor(args: argparse.Namespace) -> None:
                         live=args.live,
                         include_no=not args.yes_only,
                         fired=cycle_fired,
+                        observed_maxima=cycle_observed_maxima,
                         semaphore=semaphore,
                         price_cache=price_cache,
                     )
@@ -416,21 +521,25 @@ async def run_monitor(args: argparse.Namespace) -> None:
                 )
             )
             accepted_total = 0
+            state_changed = False
             completed_at = datetime.now(timezone.utc)
             for outcome in outcomes:
                 item = outcome.item
                 for note in outcome.notes:
                     print(note)
                 accepted_total += outcome.accepted
+                state_changed = state_changed or outcome.state_changed
                 interval = poll_interval(item, completed_at)
                 next_due[item.key] = completed_at + timedelta(seconds=interval)
 
-            if accepted_total:
+            if accepted_total or state_changed:
                 if args.live:
-                    fired = cycle_fired
-                    save_state(state_path, fired)
+                    state.fired = cycle_fired
+                    state.observed_maxima = cycle_observed_maxima
+                    save_state(state_path, state)
                 else:
                     session_seen = cycle_fired
+                    state.observed_maxima = cycle_observed_maxima
 
             if args.once:
                 return
