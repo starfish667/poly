@@ -81,6 +81,7 @@ class ActionableNoMarket:
     token_id: str
     rule: TemperatureRule
     observed_high: Decimal
+    rounded_high: Decimal
     event: WeatherEventCandidate
 
     @property
@@ -383,13 +384,13 @@ def save_state(path: Path, state: TriggerState) -> None:
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
-def rule_can_buy_no_after_high(rule: TemperatureRule, rounded_high: Decimal) -> bool:
+def rule_can_buy_no_after_high(rule: TemperatureRule, observed_high: Decimal) -> bool:
     if rule.op == "eq":
-        return rounded_high > rule.low
+        return observed_high > rule.low
     if rule.op == "range":
-        return rounded_high > rule.high
+        return observed_high > rule.high
     if rule.op == "lte":
-        return rounded_high > rule.low
+        return observed_high > rule.low
     return False
 
 
@@ -397,6 +398,7 @@ async def actionable_no_markets(
     client: AsyncPublicClient,
     event: WeatherEventCandidate,
     *,
+    observed_highs_by_unit: dict[Unit, Decimal],
     rounded_highs_by_unit: dict[Unit, Decimal],
 ) -> list[ActionableNoMarket]:
     event_payload = await client.get_event(url=event.url)
@@ -416,8 +418,13 @@ async def actionable_no_markets(
             continue
         if rule.date != event.target_date:
             continue
+        observed_high = observed_highs_by_unit.get(rule.unit)
         rounded_high = rounded_highs_by_unit.get(rule.unit)
-        if rounded_high is None or not rule_can_buy_no_after_high(rule, rounded_high):
+        if (
+            observed_high is None
+            or rounded_high is None
+            or not rule_can_buy_no_after_high(rule, observed_high)
+        ):
             continue
         if snapshot.no_token_id is None:
             continue
@@ -428,7 +435,8 @@ async def actionable_no_markets(
                 slug=snapshot.slug,
                 token_id=snapshot.no_token_id,
                 rule=rule,
-                observed_high=rounded_high,
+                observed_high=observed_high,
+                rounded_high=rounded_high,
                 event=event,
             )
         )
@@ -486,7 +494,8 @@ def build_no_trade_plans(
         plans.append(plan)
         notes.append(
             f"  plan: BUY {size} NO @ {limit_price} "
-            f"(ask={price}, high={market.observed_high}{market.rule.unit}) "
+            f"(ask={price}, raw_high={market.observed_high}{market.rule.unit}, "
+            f"rounded={market.rounded_high}{market.rule.unit}) "
             f"{market.question}"
         )
     return plans, notes
@@ -652,6 +661,7 @@ class WeatherTriggerBot:
     ) -> None:
         event_started_at = time.perf_counter()
         local_tz = ZoneInfo(event.timezone_name)
+        observed_highs_by_unit: dict[Unit, Decimal] = {}
         rounded_highs_by_unit: dict[Unit, Decimal] = {}
         increased = False
         label = event_label(event)
@@ -665,27 +675,33 @@ class WeatherTriggerBot:
             if observed is None:
                 continue
             rounded = rounded_resolution_temperature(observed)
+            observed_highs_by_unit[unit] = observed
             rounded_highs_by_unit[unit] = rounded
             key = event_unit_key(event, unit)
             previous = self.observed_maxima.get(key)
             if previous is None:
-                self.observed_maxima[key] = rounded
+                self.observed_maxima[key] = observed
                 print(
-                    f"[{utc_now()}] {label}: baseline {rounded}{unit} "
+                    f"[{utc_now()}] {label}: baseline raw {observed}{unit}, "
+                    f"rounded {rounded}{unit} "
                     f"({event.timezone_name})"
                 )
                 increased = self.trade_on_first_observation
-            elif rounded > previous:
-                self.observed_maxima[key] = rounded
+            elif observed > previous:
+                previous_rounded = rounded_resolution_temperature(previous)
+                self.observed_maxima[key] = observed
                 increased = True
                 print(
                     f"[{utc_now()}] {label}: high increased "
-                    f"{previous}{unit} -> {rounded}{unit}"
+                    f"raw {previous}{unit} -> {observed}{unit} "
+                    f"(rounded {previous_rounded}{unit} -> {rounded}{unit})"
                 )
             else:
+                previous_rounded = rounded_resolution_temperature(previous)
                 print(
                     f"[{utc_now()}] {label}: no increase "
-                    f"{rounded}{unit} <= {previous}{unit}"
+                    f"raw {observed}{unit} <= {previous}{unit} "
+                    f"(rounded {rounded}{unit} <= {previous_rounded}{unit})"
                 )
 
         if not rounded_highs_by_unit:
@@ -706,6 +722,7 @@ class WeatherTriggerBot:
         markets = await actionable_no_markets(
             client,
             event,
+            observed_highs_by_unit=observed_highs_by_unit,
             rounded_highs_by_unit=rounded_highs_by_unit,
         )
         markets_seconds = time.perf_counter() - markets_started_at
