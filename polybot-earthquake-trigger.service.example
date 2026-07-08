@@ -1,0 +1,16 @@
+[Unit]
+Description=Polymarket earthquake trigger bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/polymarket
+EnvironmentFile=/opt/polymarket/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/bin/bash /opt/polymarket/run_earthquake_trigger_live.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
