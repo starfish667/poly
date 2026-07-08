@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from decimal import Decimal
 
@@ -12,6 +13,9 @@ from polybot.earnings import earnings_signal
 from polybot.trader import BatchTrader, build_buy_plan
 from polybot.types import Signal, TradePlan
 from polybot.weather import weather_signal
+
+
+PriceLookup = Callable[[Signal], tuple[Decimal, str] | None]
 
 
 @dataclass
@@ -93,6 +97,7 @@ def skip_trade_reason(
     *,
     buy_no: bool,
     max_entry_price: Decimal | None,
+    price_lookup: PriceLookup | None = None,
 ) -> str | None:
     if signal.outcome == "NO" and not buy_no:
         return "NO signals are disabled"
@@ -100,12 +105,19 @@ def skip_trade_reason(
     if max_entry_price is None:
         return None
 
-    current_price = current_outcome_price(signal)
+    price_source = f"{signal.outcome} price"
+    current_price = None
+    if price_lookup is not None:
+        quote = price_lookup(signal)
+        if quote is not None:
+            current_price, price_source = quote
+    if current_price is None:
+        current_price = current_outcome_price(signal)
     if current_price is None:
         return f"{signal.outcome} price is unavailable"
     if current_price > max_entry_price:
         return (
-            f"{signal.outcome} price {current_price} is above "
+            f"{price_source} {current_price} is above "
             f"max_entry_price {max_entry_price}"
         )
     return None
@@ -119,10 +131,16 @@ def build_plans(
     live: bool,
     buy_no: bool,
     max_entry_price: Decimal | None = None,
+    price_lookup: PriceLookup | None = None,
 ) -> list[TradePlan]:
     plans: list[TradePlan] = []
     for signal in signals:
-        if skip_trade_reason(signal, buy_no=buy_no, max_entry_price=max_entry_price):
+        if skip_trade_reason(
+            signal,
+            buy_no=buy_no,
+            max_entry_price=max_entry_price,
+            price_lookup=price_lookup,
+        ):
             continue
         plans.append(
             build_buy_plan(

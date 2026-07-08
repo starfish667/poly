@@ -12,9 +12,12 @@ from pathlib import Path
 from typing import Any, Literal
 
 import httpx
+from polymarket import AsyncPublicClient
 from polymarket.errors import TransportError
 
-from run_event_bot import build_plans, collect_signals_timed, execute_plans, skip_trade_reason
+from run_event_bot import build_plans, collect_signals_timed, execute_plans, load_markets, skip_trade_reason
+from polybot.markets import snapshot_from_market
+from polybot.prices import PriceWebSocketCache
 from polybot.types import Signal
 
 
@@ -186,12 +189,44 @@ def signal_key(signal: Signal) -> str:
     return f"{signal.market.slug}:{signal.outcome}"
 
 
+def signal_token_id(signal: Signal) -> str | None:
+    return signal.market.yes_token_id if signal.outcome == "YES" else signal.market.no_token_id
+
+
+def websocket_price_lookup(price_cache: PriceWebSocketCache):
+    def lookup(signal: Signal) -> tuple[Decimal, str] | None:
+        price = price_cache.best_ask(signal_token_id(signal))
+        if price is None:
+            return None
+        return price, f"{signal.outcome} websocket ask"
+
+    return lookup
+
+
+async def discover_price_token_ids(items: list[WatchItem]) -> set[str]:
+    token_ids: set[str] = set()
+    async with AsyncPublicClient() as client:
+        for item in items:
+            try:
+                markets = await load_markets(client, item.url)
+            except Exception:
+                continue
+            for market in markets:
+                snapshot = snapshot_from_market(market)
+                if snapshot.yes_token_id:
+                    token_ids.add(snapshot.yes_token_id)
+                if snapshot.no_token_id:
+                    token_ids.add(snapshot.no_token_id)
+    return token_ids
+
+
 async def process_item(
     item: WatchItem,
     *,
     live: bool,
     include_no: bool,
     fired: set[str],
+    price_cache: PriceWebSocketCache | None = None,
 ) -> tuple[int, list[str]]:
     started_at = time.perf_counter()
     notes: list[str] = []
@@ -222,6 +257,7 @@ async def process_item(
             signal,
             buy_no=include_no,
             max_entry_price=item.max_entry_price,
+            price_lookup=websocket_price_lookup(price_cache) if price_cache is not None else None,
         )
         if skip_reason:
             notes.append(f"  skip: {skip_reason}")
@@ -233,6 +269,7 @@ async def process_item(
         live=live,
         buy_no=include_no,
         max_entry_price=item.max_entry_price,
+        price_lookup=websocket_price_lookup(price_cache) if price_cache is not None else None,
     )
     if not plans:
         notes.append(f"  no trade plans after filters (total={time.perf_counter() - started_at:.3f}s)")
@@ -274,6 +311,7 @@ async def safe_process_item(
     include_no: bool,
     fired: set[str],
     semaphore: asyncio.Semaphore,
+    price_cache: PriceWebSocketCache | None = None,
 ) -> ProcessOutcome:
     async with semaphore:
         try:
@@ -282,6 +320,7 @@ async def safe_process_item(
                 live=live,
                 include_no=include_no,
                 fired=fired,
+                price_cache=price_cache,
             )
             return ProcessOutcome(item=item, accepted=accepted, notes=notes)
         except (httpx.HTTPStatusError, httpx.TransportError, TransportError) as error:
@@ -305,84 +344,107 @@ async def run_monitor(args: argparse.Namespace) -> None:
     session_seen: set[str] = set()
     next_due: dict[str, datetime] = {}
     semaphore = asyncio.Semaphore(args.max_concurrency)
+    price_cache: PriceWebSocketCache | None = None
 
-    while True:
+    if args.price_websocket:
         items = load_watchlist(
             watchlist_path,
             default_interval=args.interval,
             default_active_interval=args.active_interval,
         )
-        now = datetime.now(timezone.utc)
-        item_keys = {item.key for item in items}
-        for key in list(next_due):
-            if key not in item_keys:
-                del next_due[key]
-        for item in items:
-            next_due.setdefault(item.key, now)
-
-        due_items = items if args.once else [
-            item for item in items if next_due.get(item.key, now) <= now
-        ]
-        if not due_items:
-            if not next_due:
-                sleep_for = args.interval
-            else:
-                sleep_for = max(
-                    0.1,
-                    min((due_at - now).total_seconds() for due_at in next_due.values()),
-                )
-            await asyncio.sleep(min(sleep_for, 1.0))
-            continue
-
-        active_count = sum(1 for item in due_items if is_active_window(item, now))
-        cycle_started_at = time.perf_counter()
-        print(
-            f"[{utc_now()}] cycle start: {len(due_items)}/{len(items)} due, "
-            f"active={active_count}, live={args.live}"
-        )
-        cycle_fired = set(fired)
-        if not args.live:
-            cycle_fired |= session_seen
-
-        outcomes = await asyncio.gather(
-            *(
-                safe_process_item(
-                    item,
-                    live=args.live,
-                    include_no=not args.yes_only,
-                    fired=cycle_fired,
-                    semaphore=semaphore,
-                )
-                for item in due_items
+        token_ids = await discover_price_token_ids(items)
+        if token_ids:
+            price_cache = PriceWebSocketCache(
+                token_ids,
+                max_age_seconds=args.price_websocket_max_age,
             )
-        )
-        accepted_total = 0
-        completed_at = datetime.now(timezone.utc)
-        for outcome in outcomes:
-            item = outcome.item
-            for note in outcome.notes:
-                print(note)
-            accepted_total += outcome.accepted
-            interval = poll_interval(item, completed_at)
-            next_due[item.key] = completed_at + timedelta(seconds=interval)
+            await price_cache.start()
+            print(f"[{utc_now()}] price websocket subscribed to {len(token_ids)} token(s)")
+        else:
+            print(f"[{utc_now()}] price websocket enabled, but no token ids were found")
 
-        if accepted_total:
-            if args.live:
-                fired = cycle_fired
-                save_state(state_path, fired)
-            else:
-                session_seen = cycle_fired
+    try:
+        while True:
+            items = load_watchlist(
+                watchlist_path,
+                default_interval=args.interval,
+                default_active_interval=args.active_interval,
+            )
+            now = datetime.now(timezone.utc)
+            item_keys = {item.key for item in items}
+            for key in list(next_due):
+                if key not in item_keys:
+                    del next_due[key]
+            for item in items:
+                next_due.setdefault(item.key, now)
 
-        if args.once:
-            return
-        next_interval = min(
-            max(0.1, (due_at - datetime.now(timezone.utc)).total_seconds())
-            for due_at in next_due.values()
-        )
-        print(
-            f"[{utc_now()}] cycle done in {time.perf_counter() - cycle_started_at:.3f}s; "
-            f"next check in {next_interval:.1f}s"
-        )
+            due_items = items if args.once else [
+                item for item in items if next_due.get(item.key, now) <= now
+            ]
+            if not due_items:
+                if not next_due:
+                    sleep_for = args.interval
+                else:
+                    sleep_for = max(
+                        0.1,
+                        min((due_at - now).total_seconds() for due_at in next_due.values()),
+                    )
+                await asyncio.sleep(min(sleep_for, 1.0))
+                continue
+
+            active_count = sum(1 for item in due_items if is_active_window(item, now))
+            cycle_started_at = time.perf_counter()
+            print(
+                f"[{utc_now()}] cycle start: {len(due_items)}/{len(items)} due, "
+                f"active={active_count}, live={args.live}"
+            )
+            cycle_fired = set(fired)
+            if not args.live:
+                cycle_fired |= session_seen
+
+            outcomes = await asyncio.gather(
+                *(
+                    safe_process_item(
+                        item,
+                        live=args.live,
+                        include_no=not args.yes_only,
+                        fired=cycle_fired,
+                        semaphore=semaphore,
+                        price_cache=price_cache,
+                    )
+                    for item in due_items
+                )
+            )
+            accepted_total = 0
+            completed_at = datetime.now(timezone.utc)
+            for outcome in outcomes:
+                item = outcome.item
+                for note in outcome.notes:
+                    print(note)
+                accepted_total += outcome.accepted
+                interval = poll_interval(item, completed_at)
+                next_due[item.key] = completed_at + timedelta(seconds=interval)
+
+            if accepted_total:
+                if args.live:
+                    fired = cycle_fired
+                    save_state(state_path, fired)
+                else:
+                    session_seen = cycle_fired
+
+            if args.once:
+                return
+            next_interval = min(
+                max(0.1, (due_at - datetime.now(timezone.utc)).total_seconds())
+                for due_at in next_due.values()
+            )
+            print(
+                f"[{utc_now()}] cycle done in {time.perf_counter() - cycle_started_at:.3f}s; "
+                f"next check in {next_interval:.1f}s"
+            )
+    finally:
+        if price_cache is not None:
+            await price_cache.close()
 
 
 def main() -> None:
@@ -399,6 +461,8 @@ def main() -> None:
     parser.add_argument("--active-interval", type=float, default=3, help="Polling interval inside active windows")
     parser.add_argument("--max-concurrency", type=int, default=4, help="Maximum watch items checked at once")
     parser.add_argument("--log-file", help="Append console output to this file")
+    parser.add_argument("--price-websocket", action="store_true", help="Use Polymarket websocket best ask for price filters")
+    parser.add_argument("--price-websocket-max-age", type=float, default=10, help="Maximum websocket quote age in seconds")
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--yes-only", action="store_true", help="Do not buy NO signals")
     parser.add_argument("--live", action="store_true", help="Actually batch-submit orders")
