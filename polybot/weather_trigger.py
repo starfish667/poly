@@ -24,6 +24,10 @@ from polybot.weather import (
     AVIATION_WEATHER_METAR_URL,
     TemperatureRule,
     Unit,
+    aviation_observation_temp,
+    aviation_observation_time,
+    fetch_weather_com_history,
+    historical_observation_temp,
     max_temperature_from_aviation_metars,
     parse_temperature_rule,
     rounded_resolution_temperature,
@@ -93,6 +97,13 @@ class ActionableNoMarket:
 class TriggerState:
     fired: set[str]
     observed_maxima: dict[str, Decimal]
+
+
+@dataclass(frozen=True)
+class TemperatureStats:
+    source: str
+    latest_by_unit: dict[Unit, Decimal]
+    high_by_unit: dict[Unit, Decimal]
 
 
 def utc_now() -> str:
@@ -278,6 +289,109 @@ async def fetch_aviation_metars_for_stations(
             continue
         grouped.setdefault(station_id.upper(), []).append(item)
     return grouped
+
+
+def latest_aviation_temperature(
+    observations: list[dict[str, object]],
+    *,
+    target_date: date,
+    unit: Unit,
+    local_tz: ZoneInfo,
+) -> Decimal | None:
+    latest: tuple[datetime, Decimal] | None = None
+    for item in observations:
+        observed_at = aviation_observation_time(item)
+        if observed_at is None or observed_at.astimezone(local_tz).date() != target_date:
+            continue
+        value = aviation_observation_temp(item, unit)
+        if value is None:
+            continue
+        if latest is None or observed_at > latest[0]:
+            latest = (observed_at, value)
+    return latest[1] if latest is not None else None
+
+
+def aviation_temperature_stats(
+    observations: list[dict[str, object]],
+    *,
+    target_date: date,
+    local_tz: ZoneInfo,
+) -> TemperatureStats | None:
+    high_by_unit: dict[Unit, Decimal] = {}
+    latest_by_unit: dict[Unit, Decimal] = {}
+    for unit in ("C", "F"):
+        high = max_temperature_from_aviation_metars(
+            observations,
+            target_date=target_date,
+            unit=unit,
+            local_tz=local_tz,
+        )
+        latest = latest_aviation_temperature(
+            observations,
+            target_date=target_date,
+            unit=unit,
+            local_tz=local_tz,
+        )
+        if high is not None:
+            high_by_unit[unit] = high
+        if latest is not None:
+            latest_by_unit[unit] = latest
+    if not high_by_unit:
+        return None
+    return TemperatureStats(
+        source="aviationweather",
+        latest_by_unit=latest_by_unit,
+        high_by_unit=high_by_unit,
+    )
+
+
+def latest_history_temperature(
+    observations: list[dict[str, object]],
+    unit: Unit,
+) -> Decimal | None:
+    latest: tuple[int, Decimal] | None = None
+    for item in observations:
+        observed_at = item.get("valid_time_gmt")
+        if not isinstance(observed_at, int):
+            continue
+        value = historical_observation_temp(item, unit)
+        if value is None:
+            continue
+        if latest is None or observed_at > latest[0]:
+            latest = (observed_at, value)
+    return latest[1] if latest is not None else None
+
+
+def history_temperature_stats(
+    observations: list[dict[str, object]],
+) -> TemperatureStats | None:
+    high_by_unit: dict[Unit, Decimal] = {}
+    latest_by_unit: dict[Unit, Decimal] = {}
+    for unit in ("C", "F"):
+        values = [
+            value
+            for item in observations
+            if (value := historical_observation_temp(item, unit)) is not None
+        ]
+        latest = latest_history_temperature(observations, unit)
+        if values:
+            high_by_unit[unit] = max(values)
+        if latest is not None:
+            latest_by_unit[unit] = latest
+    if not high_by_unit:
+        return None
+    return TemperatureStats(
+        source="weather.com",
+        latest_by_unit=latest_by_unit,
+        high_by_unit=high_by_unit,
+    )
+
+
+async def fetch_history_for_event(event: WeatherEventCandidate) -> list[dict[str, object]]:
+    try:
+        return await fetch_weather_com_history(event.source, event.target_date)
+    except Exception:
+        return []
 
 
 async def benchmark_get(
@@ -641,13 +755,25 @@ class WeatherTriggerBot:
         cycle_started_at = time.perf_counter()
         station_ids = [event.station_id for event in events]
         weather_started_at = time.perf_counter()
-        metars_by_station = await fetch_aviation_metars_for_stations(
-            station_ids,
-            hours=self.weather_hours,
+        metars_by_station, history_results = await asyncio.gather(
+            fetch_aviation_metars_for_stations(
+                station_ids,
+                hours=self.weather_hours,
+            ),
+            asyncio.gather(*(fetch_history_for_event(event) for event in events)),
         )
+        history_by_event = {
+            event.url: history
+            for event, history in zip(events, history_results, strict=True)
+        }
         weather_seconds = time.perf_counter() - weather_started_at
         for event in events:
-            await self.process_event(client, event, metars_by_station.get(event.station_id, []))
+            await self.process_event(
+                client,
+                event,
+                metars_by_station.get(event.station_id, []),
+                history_by_event.get(event.url, []),
+            )
         print(
             f"[{utc_now()}] cycle timing: weather={weather_seconds:.3f}s "
             f"total={time.perf_counter() - cycle_started_at:.3f}s"
@@ -658,22 +784,32 @@ class WeatherTriggerBot:
         client: AsyncPublicClient,
         event: WeatherEventCandidate,
         metars: list[dict[str, object]],
+        history: list[dict[str, object]],
     ) -> None:
         event_started_at = time.perf_counter()
         local_tz = ZoneInfo(event.timezone_name)
+        history_stats = history_temperature_stats(history)
+        aviation_stats = aviation_temperature_stats(
+            metars,
+            target_date=event.target_date,
+            local_tz=local_tz,
+        )
+        stats = history_stats or aviation_stats
         observed_highs_by_unit: dict[Unit, Decimal] = {}
         rounded_highs_by_unit: dict[Unit, Decimal] = {}
         increased = False
         label = event_label(event)
-        for unit in ("C", "F"):
-            observed = max_temperature_from_aviation_metars(
-                metars,
-                target_date=event.target_date,
-                unit=unit,
-                local_tz=local_tz,
+        if stats is None:
+            print(
+                f"[{utc_now()}] {label}: waiting for first local-day weather observation "
+                f"(event={time.perf_counter() - event_started_at:.3f}s)"
             )
+            return
+        for unit in ("C", "F"):
+            observed = stats.high_by_unit.get(unit)
             if observed is None:
                 continue
+            latest = stats.latest_by_unit.get(unit)
             rounded = rounded_resolution_temperature(observed)
             observed_highs_by_unit[unit] = observed
             rounded_highs_by_unit[unit] = rounded
@@ -682,9 +818,9 @@ class WeatherTriggerBot:
             if previous is None:
                 self.observed_maxima[key] = observed
                 print(
-                    f"[{utc_now()}] {label}: baseline raw {observed}{unit}, "
-                    f"rounded {rounded}{unit} "
-                    f"({event.timezone_name})"
+                    f"[{utc_now()}] {label}: baseline source={stats.source} "
+                    f"latest={latest}{unit} max={observed}{unit} "
+                    f"rounded={rounded}{unit} ({event.timezone_name})"
                 )
                 increased = self.trade_on_first_observation
             elif observed > previous:
@@ -692,21 +828,23 @@ class WeatherTriggerBot:
                 self.observed_maxima[key] = observed
                 increased = True
                 print(
-                    f"[{utc_now()}] {label}: high increased "
-                    f"raw {previous}{unit} -> {observed}{unit} "
+                    f"[{utc_now()}] {label}: high increased source={stats.source} "
+                    f"latest={latest}{unit} max={observed}{unit} "
+                    f"previous_max={previous}{unit} "
                     f"(rounded {previous_rounded}{unit} -> {rounded}{unit})"
                 )
             else:
                 previous_rounded = rounded_resolution_temperature(previous)
                 print(
-                    f"[{utc_now()}] {label}: no increase "
-                    f"raw {observed}{unit} <= {previous}{unit} "
+                    f"[{utc_now()}] {label}: no increase source={stats.source} "
+                    f"latest={latest}{unit} max={observed}{unit} "
+                    f"previous_max={previous}{unit} "
                     f"(rounded {rounded}{unit} <= {previous_rounded}{unit})"
                 )
 
         if not rounded_highs_by_unit:
             print(
-                f"[{utc_now()}] {label}: waiting for first local-day METAR observation "
+                f"[{utc_now()}] {label}: waiting for first local-day weather observation "
                 f"(event={time.perf_counter() - event_started_at:.3f}s)"
             )
             return
