@@ -19,6 +19,8 @@ MAX_ENTRY_PRICE="${POLYBOT_TRIGGER_MAX_ENTRY_PRICE:-0.99}"
 LIMIT_PRICE="${POLYBOT_TRIGGER_LIMIT_PRICE:-0.99}"
 SIZE="${POLYBOT_TRIGGER_SIZE:-5}"
 SOURCE="${POLYBOT_TRIGGER_SOURCE:-auto}"
+PRICE_WEBSOCKET_MAX_AGE="${POLYBOT_TRIGGER_PRICE_WEBSOCKET_MAX_AGE:-10}"
+PRICE_WAIT_SECONDS="${POLYBOT_TRIGGER_PRICE_WAIT_SECONDS:-2}"
 LOG_FILE="logs/weather-trigger-dry-$(date -u +%Y%m%d-%H%M%S).log"
 PYTHON_BIN="${POLYBOT_PYTHON:-python}"
 
@@ -36,6 +38,8 @@ ARGS=(
   --limit-price "$LIMIT_PRICE"
   --size "$SIZE"
   --source "$SOURCE"
+  --price-websocket-max-age "$PRICE_WEBSOCKET_MAX_AGE"
+  --price-wait-seconds "$PRICE_WAIT_SECONDS"
   --state weather_trigger_dry_state.json
   --log-file "$LOG_FILE"
 )

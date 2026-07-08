@@ -13,10 +13,10 @@ from typing import Literal
 from zoneinfo import ZoneInfo
 
 import httpx
-from polymarket import AsyncPublicClient, PriceRequest
+from polymarket import AsyncPublicClient
 
 from polybot.markets import snapshot_from_market
-from polybot.prices import parse_decimal
+from polybot.prices import PriceWebSocketCache
 from polybot.trader import build_buy_plan
 from polybot.types import TradePlan
 from polybot.weather import (
@@ -431,19 +431,20 @@ async def actionable_no_markets(
     return markets
 
 
-async def buy_prices(
+async def no_token_ids_for_events(
     client: AsyncPublicClient,
-    token_ids: list[str],
-) -> dict[str, Decimal | None]:
-    prices: dict[str, Decimal | None] = {}
-    for index in range(0, len(token_ids), 50):
-        chunk = token_ids[index : index + 50]
-        requests = [PriceRequest(token_id=token_id, side="BUY") for token_id in chunk]
-        response = await client.get_prices(requests=requests)
-        for token_id in chunk:
-            by_side = response.get(token_id, {})
-            prices[token_id] = parse_decimal(by_side.get("BUY"))
-    return prices
+    events: list[WeatherEventCandidate],
+) -> set[str]:
+    token_ids: set[str] = set()
+    for event in events:
+        event_payload = await client.get_event(url=event.url)
+        for market in event_payload.markets:
+            if not is_tradeable_weather_market(market):
+                continue
+            snapshot = snapshot_from_market(market)
+            if snapshot.no_token_id is not None:
+                token_ids.add(snapshot.no_token_id)
+    return token_ids
 
 
 def build_no_trade_plans(
@@ -464,7 +465,7 @@ def build_no_trade_plans(
             continue
         price = prices.get(market.token_id)
         if price is None:
-            notes.append(f"  skip price unavailable: NO {market.question}")
+            notes.append(f"  skip websocket ask unavailable/stale: NO {market.question}")
             continue
         if price > max_entry_price:
             notes.append(
@@ -529,6 +530,8 @@ class WeatherTriggerBot:
         source: StrategySource,
         weather_hours: int,
         trade_on_first_observation: bool,
+        price_websocket_max_age: float,
+        price_wait_seconds: float,
     ) -> None:
         self.live = live
         self.city_count = city_count
@@ -547,9 +550,13 @@ class WeatherTriggerBot:
         self.source = source
         self.weather_hours = weather_hours
         self.trade_on_first_observation = trade_on_first_observation
+        self.price_websocket_max_age = price_websocket_max_age
+        self.price_wait_seconds = price_wait_seconds
         self.state = load_state(state_path)
         self.session_fired: set[str] = set()
         self.session_observed_maxima = dict(self.state.observed_maxima)
+        self.price_cache: PriceWebSocketCache | None = None
+        self.price_token_ids: set[str] = set()
 
     @property
     def fired(self) -> set[str]:
@@ -563,14 +570,75 @@ class WeatherTriggerBot:
         if self.live:
             save_state(self.state_path, self.state)
 
+    async def close_price_cache(self) -> None:
+        if self.price_cache is not None:
+            await self.price_cache.close()
+            self.price_cache = None
+            self.price_token_ids = set()
+
+    async def ensure_price_cache(self, token_ids: set[str]) -> None:
+        wanted = {str(token_id) for token_id in token_ids if token_id}
+        if not wanted:
+            return
+        if self.price_cache is not None and wanted.issubset(self.price_token_ids):
+            return
+
+        await self.close_price_cache()
+        self.price_cache = PriceWebSocketCache(
+            wanted,
+            max_age_seconds=self.price_websocket_max_age,
+        )
+        self.price_token_ids = wanted
+        await self.price_cache.start()
+        print(f"[{utc_now()}] price websocket subscribed to {len(wanted)} NO token(s)")
+
+    async def refresh_price_cache_for_events(
+        self,
+        client: AsyncPublicClient,
+        events: list[WeatherEventCandidate],
+    ) -> float:
+        started_at = time.perf_counter()
+        token_ids = await no_token_ids_for_events(client, events)
+        await self.ensure_price_cache(token_ids)
+        return time.perf_counter() - started_at
+
+    async def websocket_prices(
+        self,
+        markets: list[ActionableNoMarket],
+    ) -> dict[str, Decimal | None]:
+        token_ids = {market.token_id for market in markets}
+        await self.ensure_price_cache(token_ids)
+        if self.price_cache is None:
+            return {token_id: None for token_id in token_ids}
+
+        deadline = time.monotonic() + self.price_wait_seconds
+        prices: dict[str, Decimal | None] = {}
+        while True:
+            prices = {
+                token_id: self.price_cache.best_ask(token_id)
+                for token_id in token_ids
+            }
+            if all(price is not None for price in prices.values()):
+                return prices
+            if time.monotonic() >= deadline:
+                return prices
+            await asyncio.sleep(0.05)
+
     async def run_once(self, client: AsyncPublicClient, events: list[WeatherEventCandidate]) -> None:
+        cycle_started_at = time.perf_counter()
         station_ids = [event.station_id for event in events]
+        weather_started_at = time.perf_counter()
         metars_by_station = await fetch_aviation_metars_for_stations(
             station_ids,
             hours=self.weather_hours,
         )
+        weather_seconds = time.perf_counter() - weather_started_at
         for event in events:
             await self.process_event(client, event, metars_by_station.get(event.station_id, []))
+        print(
+            f"[{utc_now()}] cycle timing: weather={weather_seconds:.3f}s "
+            f"total={time.perf_counter() - cycle_started_at:.3f}s"
+        )
 
     async def process_event(
         self,
@@ -578,6 +646,7 @@ class WeatherTriggerBot:
         event: WeatherEventCandidate,
         metars: list[dict[str, object]],
     ) -> None:
+        event_started_at = time.perf_counter()
         local_tz = ZoneInfo(event.timezone_name)
         rounded_highs_by_unit: dict[Unit, Decimal] = {}
         increased = False
@@ -615,23 +684,37 @@ class WeatherTriggerBot:
                 )
 
         if not rounded_highs_by_unit:
-            print(f"[{utc_now()}] {event.city}: no METAR observations")
+            print(
+                f"[{utc_now()}] {event.city}: no METAR observations "
+                f"(event={time.perf_counter() - event_started_at:.3f}s)"
+            )
             return
         if not increased:
             self.maybe_save_state()
+            print(
+                f"[{utc_now()}] {event.city}: timing "
+                f"event={time.perf_counter() - event_started_at:.3f}s"
+            )
             return
 
+        markets_started_at = time.perf_counter()
         markets = await actionable_no_markets(
             client,
             event,
             rounded_highs_by_unit=rounded_highs_by_unit,
         )
+        markets_seconds = time.perf_counter() - markets_started_at
         if not markets:
-            print(f"[{utc_now()}] {event.city}: high increased, no NO markets below high")
+            print(
+                f"[{utc_now()}] {event.city}: high increased, no NO markets below high "
+                f"(markets={markets_seconds:.3f}s event={time.perf_counter() - event_started_at:.3f}s)"
+            )
             self.maybe_save_state()
             return
 
-        prices = await buy_prices(client, [market.token_id for market in markets])
+        prices_started_at = time.perf_counter()
+        prices = await self.websocket_prices(markets)
+        prices_seconds = time.perf_counter() - prices_started_at
         plans, notes = build_no_trade_plans(
             markets,
             prices=prices,
@@ -647,11 +730,18 @@ class WeatherTriggerBot:
 
         if not plans:
             self.maybe_save_state()
+            print(
+                f"[{utc_now()}] {event.city}: timing "
+                f"markets={markets_seconds:.3f}s websocket_price={prices_seconds:.3f}s "
+                f"event={time.perf_counter() - event_started_at:.3f}s"
+            )
             return
 
         from run_event_bot import execute_plans
 
+        execute_started_at = time.perf_counter()
         results = await execute_plans(plans, live=self.live)
+        execute_seconds = time.perf_counter() - execute_started_at
         for result in results:
             plan = result.plan
             print(
@@ -661,6 +751,11 @@ class WeatherTriggerBot:
             if result.ok:
                 self.fired.add(f"{plan.market.slug}:NO")
         self.maybe_save_state()
+        print(
+            f"[{utc_now()}] {event.city}: timing "
+            f"markets={markets_seconds:.3f}s websocket_price={prices_seconds:.3f}s "
+            f"execute={execute_seconds:.3f}s event={time.perf_counter() - event_started_at:.3f}s"
+        )
 
     async def run_forever(self) -> None:
         if self.live and os.getenv("POLYBOT_ENABLE_LIVE") != "1":
@@ -669,42 +764,58 @@ class WeatherTriggerBot:
         events: list[WeatherEventCandidate] = []
         next_discovery = 0.0
         source_announced = False
-        async with AsyncPublicClient() as client:
-            while True:
-                now = time.monotonic()
-                if now >= next_discovery:
-                    events = await discover_weather_events(
-                        client,
-                        city_count=self.city_count,
-                        pages=self.pages,
-                        page_size=self.page_size,
-                        lookahead_days=self.lookahead_days,
-                        min_liquidity=self.min_liquidity,
-                        max_event_volume=self.max_event_volume,
-                        max_event_liquidity=self.max_event_liquidity,
-                    )
-                    if not events:
-                        print(f"[{utc_now()}] discovery found no eligible weather events")
-                    else:
-                        print(f"[{utc_now()}] monitoring {len(events)} weather event(s):")
-                        for event in events:
-                            print(
-                                f"  {event.city} {event.target_date} {event.station_id} "
-                                f"vol={event.volume} liq={event.liquidity} url={event.url}"
-                            )
-                    if not source_announced:
-                        decision = await choose_weather_source(
-                            self.source,
-                            station_ids=[event.station_id for event in events],
-                            poll_interval=self.poll_interval,
+        try:
+            async with AsyncPublicClient() as client:
+                while True:
+                    now = time.monotonic()
+                    if now >= next_discovery:
+                        discovery_started_at = time.perf_counter()
+                        events = await discover_weather_events(
+                            client,
+                            city_count=self.city_count,
+                            pages=self.pages,
+                            page_size=self.page_size,
+                            lookahead_days=self.lookahead_days,
+                            min_liquidity=self.min_liquidity,
+                            max_event_volume=self.max_event_volume,
+                            max_event_liquidity=self.max_event_liquidity,
                         )
-                        print(f"[{utc_now()}] source={decision.name}: {decision.reason}")
-                        source_announced = True
-                    next_discovery = now + self.discovery_interval
+                        discovery_seconds = time.perf_counter() - discovery_started_at
+                        if not events:
+                            print(
+                                f"[{utc_now()}] discovery found no eligible weather events "
+                                f"(discovery={discovery_seconds:.3f}s)"
+                            )
+                        else:
+                            print(
+                                f"[{utc_now()}] monitoring {len(events)} weather event(s) "
+                                f"(discovery={discovery_seconds:.3f}s):"
+                            )
+                            for event in events:
+                                print(
+                                    f"  {event.city} {event.target_date} {event.station_id} "
+                                    f"vol={event.volume} liq={event.liquidity} url={event.url}"
+                                )
+                            websocket_seconds = await self.refresh_price_cache_for_events(client, events)
+                            print(
+                                f"[{utc_now()}] websocket token refresh timing: "
+                                f"{websocket_seconds:.3f}s"
+                            )
+                        if not source_announced:
+                            decision = await choose_weather_source(
+                                self.source,
+                                station_ids=[event.station_id for event in events],
+                                poll_interval=self.poll_interval,
+                            )
+                            print(f"[{utc_now()}] source={decision.name}: {decision.reason}")
+                            source_announced = True
+                        next_discovery = time.monotonic() + self.discovery_interval
 
-                if events:
-                    try:
-                        await self.run_once(client, events)
-                    except Exception as error:  # keep the bot alive
-                        print(f"[{utc_now()}] ERROR {type(error).__name__}: {error}")
-                await asyncio.sleep(self.poll_interval)
+                    if events:
+                        try:
+                            await self.run_once(client, events)
+                        except Exception as error:  # keep the bot alive
+                            print(f"[{utc_now()}] ERROR {type(error).__name__}: {error}")
+                    await asyncio.sleep(self.poll_interval)
+        finally:
+            await self.close_price_cache()

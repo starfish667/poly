@@ -39,6 +39,8 @@ def main() -> None:
     parser.add_argument("--state", default="weather_trigger_state.json")
     parser.add_argument("--source", choices=("auto", "aviationweather", "ecmwf"), default="auto")
     parser.add_argument("--weather-hours", type=int, default=72)
+    parser.add_argument("--price-websocket-max-age", type=float, default=10)
+    parser.add_argument("--price-wait-seconds", type=float, default=2)
     parser.add_argument("--trade-on-first-observation", action="store_true")
     parser.add_argument("--log-file")
     parser.add_argument("--live", action="store_true")
@@ -65,6 +67,8 @@ def main() -> None:
         source=args.source,
         weather_hours=args.weather_hours,
         trade_on_first_observation=args.trade_on_first_observation,
+        price_websocket_max_age=args.price_websocket_max_age,
+        price_wait_seconds=args.price_wait_seconds,
     )
     asyncio.run(bot.run_forever())
 
