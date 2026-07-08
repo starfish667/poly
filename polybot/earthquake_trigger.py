@@ -22,7 +22,7 @@ from polybot.types import MarketSnapshot, Outcome, TradePlan
 
 
 BucketKind = Literal["exact", "gt"]
-TradePhase = Literal["count-no", "final-yes"]
+TradePhase = Literal["count-no", "final-yes", "final-no"]
 ReviewStatus = Literal["all", "reviewed"]
 
 DEFAULT_EVENT_URL = (
@@ -783,10 +783,6 @@ class EarthquakeTriggerBot:
         snapshot: EarthquakeSnapshot,
         markets: list[EarthquakeMarket],
     ) -> None:
-        state = self.active_state
-        if state.final_yes_bought:
-            return
-
         now = datetime.now(timezone.utc)
         settlement_at = rule.end_utc.timestamp() + self.settlement_delay_seconds
         if now.timestamp() < settlement_at:
@@ -815,10 +811,19 @@ class EarthquakeTriggerBot:
             return
 
         print(
-            f"[{utc_now()}] final YES candidate count={snapshot.count} "
-            f"bucket={matching[0].bucket.label}"
+            f"[{utc_now()}] final settlement candidates count={snapshot.count} "
+            f"correct_bucket={matching[0].bucket.label}"
         )
-        await self.execute_candidates([(matching[0], "YES", "final-yes")])
+        correct_market = matching[0]
+        candidates: list[tuple[EarthquakeMarket, Outcome, TradePhase]] = [
+            (correct_market, "YES", "final-yes")
+        ]
+        candidates.extend(
+            (market, "NO", "final-no")
+            for market in markets
+            if market.snapshot.slug != correct_market.snapshot.slug
+        )
+        await self.execute_candidates(candidates)
 
     async def run_once(
         self,
