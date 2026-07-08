@@ -32,7 +32,7 @@ def main() -> None:
         )
     )
     parser.add_argument("--event-url", default=DEFAULT_EVENT_URL)
-    parser.add_argument("--poll-interval", type=float, default=5)
+    parser.add_argument("--poll-interval", type=float, default=0.5)
     parser.add_argument("--market-refresh-interval", type=float, default=60)
     parser.add_argument("--state", default="earthquake_trigger_state.json")
     parser.add_argument("--min-magnitude", type=decimal_arg)
