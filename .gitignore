@@ -17,6 +17,9 @@ logs/
 
 monitor_state.json
 weather_monitor_state.json
+weather_trigger_state.json
+weather_trigger_dry_state.json
+weather_trigger.pid
 
 .agents/
 .codex/
