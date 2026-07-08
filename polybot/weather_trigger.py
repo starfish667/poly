@@ -343,6 +343,10 @@ def event_unit_key(event: WeatherEventCandidate, unit: Unit) -> str:
     return f"{event.url}|{unit}"
 
 
+def event_label(event: WeatherEventCandidate) -> str:
+    return f"{event.city} {event.target_date.isoformat()} {event.station_id}"
+
+
 def load_state(path: Path) -> TriggerState:
     if not path.exists():
         return TriggerState(fired=set(), observed_maxima={})
@@ -650,6 +654,7 @@ class WeatherTriggerBot:
         local_tz = ZoneInfo(event.timezone_name)
         rounded_highs_by_unit: dict[Unit, Decimal] = {}
         increased = False
+        label = event_label(event)
         for unit in ("C", "F"):
             observed = max_temperature_from_aviation_metars(
                 metars,
@@ -666,33 +671,33 @@ class WeatherTriggerBot:
             if previous is None:
                 self.observed_maxima[key] = rounded
                 print(
-                    f"[{utc_now()}] {event.city}: baseline {rounded}{unit} "
-                    f"for {event.target_date} ({event.timezone_name})"
+                    f"[{utc_now()}] {label}: baseline {rounded}{unit} "
+                    f"({event.timezone_name})"
                 )
                 increased = self.trade_on_first_observation
             elif rounded > previous:
                 self.observed_maxima[key] = rounded
                 increased = True
                 print(
-                    f"[{utc_now()}] {event.city}: high increased "
+                    f"[{utc_now()}] {label}: high increased "
                     f"{previous}{unit} -> {rounded}{unit}"
                 )
             else:
                 print(
-                    f"[{utc_now()}] {event.city}: no increase "
+                    f"[{utc_now()}] {label}: no increase "
                     f"{rounded}{unit} <= {previous}{unit}"
                 )
 
         if not rounded_highs_by_unit:
             print(
-                f"[{utc_now()}] {event.city}: no METAR observations "
+                f"[{utc_now()}] {label}: waiting for first local-day METAR observation "
                 f"(event={time.perf_counter() - event_started_at:.3f}s)"
             )
             return
         if not increased:
             self.maybe_save_state()
             print(
-                f"[{utc_now()}] {event.city}: timing "
+                f"[{utc_now()}] {label}: timing "
                 f"event={time.perf_counter() - event_started_at:.3f}s"
             )
             return
@@ -706,7 +711,7 @@ class WeatherTriggerBot:
         markets_seconds = time.perf_counter() - markets_started_at
         if not markets:
             print(
-                f"[{utc_now()}] {event.city}: high increased, no NO markets below high "
+                f"[{utc_now()}] {label}: high increased, no NO markets below high "
                 f"(markets={markets_seconds:.3f}s event={time.perf_counter() - event_started_at:.3f}s)"
             )
             self.maybe_save_state()
@@ -724,14 +729,14 @@ class WeatherTriggerBot:
             live=self.live,
             fired=self.fired,
         )
-        print(f"[{utc_now()}] {event.city}: {len(markets)} actionable NO market(s)")
+        print(f"[{utc_now()}] {label}: {len(markets)} actionable NO market(s)")
         for note in notes:
             print(note)
 
         if not plans:
             self.maybe_save_state()
             print(
-                f"[{utc_now()}] {event.city}: timing "
+                f"[{utc_now()}] {label}: timing "
                 f"markets={markets_seconds:.3f}s websocket_price={prices_seconds:.3f}s "
                 f"event={time.perf_counter() - event_started_at:.3f}s"
             )
@@ -752,7 +757,7 @@ class WeatherTriggerBot:
                 self.fired.add(f"{plan.market.slug}:NO")
         self.maybe_save_state()
         print(
-            f"[{utc_now()}] {event.city}: timing "
+            f"[{utc_now()}] {label}: timing "
             f"markets={markets_seconds:.3f}s websocket_price={prices_seconds:.3f}s "
             f"execute={execute_seconds:.3f}s event={time.perf_counter() - event_started_at:.3f}s"
         )
