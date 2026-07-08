@@ -29,6 +29,7 @@ TEMP_MARKET_SUFFIX = re.compile(
     r"-(?:neg)?\d+(?:pt\d+)?c(?:orbelow|orhigher)?$",
     flags=re.IGNORECASE,
 )
+SETTLED_PRICE = Decimal("0.995")
 
 
 @dataclass
@@ -43,6 +44,7 @@ class WeatherEvent:
     liquidity: Decimal
     volume_24hr: Decimal
     market_count: int = 0
+    open_market_count: int = 0
 
     @property
     def url(self) -> str:
@@ -91,6 +93,18 @@ def is_tradeable_weather_market(market: object) -> bool:
     return "wunderground.com/history/daily" in snapshot.source.lower()
 
 
+def is_open_price_pair(market: object) -> bool:
+    snapshot = snapshot_from_market(market)
+    yes_price = snapshot.yes_price
+    no_price = snapshot.no_price
+    return (
+        yes_price is not None
+        and no_price is not None
+        and yes_price < SETTLED_PRICE
+        and no_price < SETTLED_PRICE
+    )
+
+
 def event_from_market(market: object) -> WeatherEvent | None:
     if not is_tradeable_weather_market(market):
         return None
@@ -122,6 +136,7 @@ def event_from_market(market: object) -> WeatherEvent | None:
         liquidity=snapshot.liquidity,
         volume_24hr=snapshot.volume_24hr,
         market_count=1,
+        open_market_count=1 if is_open_price_pair(market) else 0,
     )
 
 
@@ -130,13 +145,17 @@ def merge_event(old: WeatherEvent, new: WeatherEvent) -> WeatherEvent:
     old.liquidity += new.liquidity
     old.volume_24hr += new.volume_24hr
     old.market_count += 1
+    old.open_market_count += new.open_market_count
     return old
 
 
 def within_date_window(event: WeatherEvent, days: int) -> bool:
+    utc_today = datetime.now(timezone.utc).date()
+    if event.target_date < utc_today:
+        return False
     local_today = datetime.now(timezone.utc).astimezone(ZoneInfo(event.timezone_name)).date()
     offset = (event.target_date - local_today).days
-    return -1 <= offset <= days
+    return 0 <= offset <= days
 
 
 async def collect_weather_events(
@@ -260,6 +279,7 @@ async def main() -> None:
             event
             for event in events
             if within_date_window(event, args.days)
+            and event.open_market_count > 0
             and event.liquidity >= min_liquidity
             and event.volume <= max_volume
         ]
@@ -288,6 +308,7 @@ async def main() -> None:
         print(
             f"- {event.target_date} {event.city:14s} {event.station_id:4s} "
             f"{event.timezone_name:20s} markets={event.market_count:2d} "
+            f"open={event.open_market_count:2d} "
             f"vol={event.volume} vol24={event.volume_24hr} liq={event.liquidity}"
         )
 
