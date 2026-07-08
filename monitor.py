@@ -233,6 +233,7 @@ def filter_temperature_increases(
     *,
     item_url: str,
     observed_maxima: dict[str, Decimal],
+    observations: list[tuple[Decimal, str]] | None = None,
 ) -> tuple[list[Signal], list[str], bool]:
     passthrough: list[Signal] = []
     grouped: dict[str, list[Signal]] = {}
@@ -249,11 +250,18 @@ def filter_temperature_increases(
         if old_value is None or value > old_value[0]:
             grouped_values[key] = (value, unit)
 
+    if observations:
+        for value, unit in observations:
+            key = f"{item_url}|{unit.upper()}"
+            old_value = grouped_values.get(key)
+            if old_value is None or value > old_value[0]:
+                grouped_values[key] = (value, unit.upper())
+
     filtered = list(passthrough)
     notes: list[str] = []
     state_changed = False
-    for key, grouped_signals in grouped.items():
-        value, unit = grouped_values[key]
+    for key, (value, unit) in grouped_values.items():
+        grouped_signals = grouped.get(key, [])
         previous = observed_maxima.get(key)
         if previous is None:
             observed_maxima[key] = value
@@ -323,6 +331,7 @@ async def process_item(
         signals,
         item_url=item.url,
         observed_maxima=observed_maxima,
+        observations=timing.weather_observations,
     )
     fresh = [signal for signal in signals if signal_key(signal) not in fired]
     timing_text = (

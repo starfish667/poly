@@ -521,6 +521,11 @@ async def weather_signal(market: object, *, timing: dict[str, float] | None = No
     )
     if observed is None:
         return None
+    rounded_observed = rounded_resolution_temperature(observed)
+    if timing is not None:
+        observations = timing.setdefault("weather_observations", [])
+        if isinstance(observations, list):
+            observations.append((rounded_observed, rule.unit))
     resolved = resolve_temperature_outcome(
         rule,
         observed,
@@ -529,7 +534,6 @@ async def weather_signal(market: object, *, timing: dict[str, float] | None = No
     if resolved is None:
         return None
     outcome, detail = resolved
-    rounded_observed = rounded_resolution_temperature(observed)
     return Signal(
         market=snapshot,
         outcome=outcome,

@@ -6,6 +6,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from decimal import Decimal
+from typing import Any
 
 from polymarket import AsyncPublicClient
 
@@ -24,6 +25,23 @@ class CollectionTiming:
     aviation_seconds: float = 0.0
     signal_seconds: float = 0.0
     total_seconds: float = 0.0
+    weather_observations: list[tuple[Decimal, str]] | None = None
+
+
+def merge_extra_timing(timing: CollectionTiming, extra_timing: dict[str, Any]) -> None:
+    timing.aviation_seconds += float(extra_timing.get("aviation_seconds", 0.0))
+    observations = extra_timing.get("weather_observations")
+    if isinstance(observations, list):
+        if timing.weather_observations is None:
+            timing.weather_observations = []
+        for observation in observations:
+            if (
+                isinstance(observation, tuple)
+                and len(observation) == 2
+                and isinstance(observation[0], Decimal)
+                and isinstance(observation[1], str)
+            ):
+                timing.weather_observations.append(observation)
 
 
 async def load_markets(client: AsyncPublicClient, url: str) -> list[object]:
@@ -39,12 +57,12 @@ async def signal_for(
     *,
     timing: CollectionTiming | None = None,
 ) -> Signal | None:
-    extra_timing: dict[str, float] = {}
+    extra_timing: dict[str, Any] = {}
     started_at = time.perf_counter()
     if strategy == "weather":
         signal = await weather_signal(market, timing=extra_timing)
         if timing is not None:
-            timing.aviation_seconds += extra_timing.get("aviation_seconds", 0.0)
+            merge_extra_timing(timing, extra_timing)
             timing.signal_seconds += time.perf_counter() - started_at
         return signal
     if strategy == "earnings":
@@ -54,7 +72,7 @@ async def signal_for(
         return signal
     signal = await weather_signal(market, timing=extra_timing)
     if timing is not None:
-        timing.aviation_seconds += extra_timing.get("aviation_seconds", 0.0)
+        merge_extra_timing(timing, extra_timing)
     if signal is not None:
         if timing is not None:
             timing.signal_seconds += time.perf_counter() - started_at
