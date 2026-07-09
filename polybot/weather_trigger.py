@@ -97,6 +97,7 @@ class ActionableNoMarket:
 class TriggerState:
     fired: set[str]
     observed_maxima: dict[str, Decimal]
+    checked_maxima: dict[str, Decimal]
 
 
 @dataclass(frozen=True)
@@ -465,15 +466,16 @@ def event_label(event: WeatherEventCandidate) -> str:
 
 def load_state(path: Path) -> TriggerState:
     if not path.exists():
-        return TriggerState(fired=set(), observed_maxima={})
+        return TriggerState(fired=set(), observed_maxima={}, checked_maxima={})
     try:
         raw = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError):
-        return TriggerState(fired=set(), observed_maxima={})
+        return TriggerState(fired=set(), observed_maxima={}, checked_maxima={})
     if not isinstance(raw, dict):
-        return TriggerState(fired=set(), observed_maxima={})
+        return TriggerState(fired=set(), observed_maxima={}, checked_maxima={})
     fired = raw.get("fired")
     observed_maxima = raw.get("observed_maxima")
+    checked_maxima = raw.get("checked_maxima")
     return TriggerState(
         fired={str(item) for item in fired} if isinstance(fired, list) else set(),
         observed_maxima=(
@@ -482,6 +484,14 @@ def load_state(path: Path) -> TriggerState:
                 for key, value in observed_maxima.items()
             }
             if isinstance(observed_maxima, dict)
+            else {}
+        ),
+        checked_maxima=(
+            {
+                str(key): Decimal(str(value))
+                for key, value in checked_maxima.items()
+            }
+            if isinstance(checked_maxima, dict)
             else {}
         ),
     )
@@ -494,6 +504,10 @@ def save_state(path: Path, state: TriggerState) -> None:
         "observed_maxima": {
             key: str(value)
             for key, value in sorted(state.observed_maxima.items())
+        },
+        "checked_maxima": {
+            key: str(value)
+            for key, value in sorted(state.checked_maxima.items())
         },
     }
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -681,6 +695,7 @@ class WeatherTriggerBot:
         self.state = load_state(state_path)
         self.session_fired: set[str] = set()
         self.session_observed_maxima = dict(self.state.observed_maxima)
+        self.session_checked_maxima = dict(self.state.checked_maxima)
         self.price_cache: PriceWebSocketCache | None = None
         self.price_token_ids: set[str] = set()
 
@@ -691,6 +706,10 @@ class WeatherTriggerBot:
     @property
     def observed_maxima(self) -> dict[str, Decimal]:
         return self.state.observed_maxima if self.live else self.session_observed_maxima
+
+    @property
+    def checked_maxima(self) -> dict[str, Decimal]:
+        return self.state.checked_maxima if self.live else self.session_checked_maxima
 
     def maybe_save_state(self) -> None:
         if self.live:
@@ -796,7 +815,7 @@ class WeatherTriggerBot:
         stats = history_stats or aviation_stats
         observed_highs_by_unit: dict[Unit, Decimal] = {}
         rounded_highs_by_unit: dict[Unit, Decimal] = {}
-        increased = False
+        needs_trade_check = False
         label = event_label(event)
         if stats is None:
             print(
@@ -814,6 +833,9 @@ class WeatherTriggerBot:
             rounded_highs_by_unit[unit] = rounded
             key = event_unit_key(event, unit)
             previous = self.observed_maxima.get(key)
+            checked = self.checked_maxima.get(key)
+            if checked is None or observed > checked:
+                needs_trade_check = True
             if previous is None:
                 self.observed_maxima[key] = observed
                 print(
@@ -821,11 +843,9 @@ class WeatherTriggerBot:
                     f"latest={latest}{unit} max={observed}{unit} "
                     f"rounded={rounded}{unit} ({event.timezone_name})"
                 )
-                increased = True
             elif observed > previous:
                 previous_rounded = rounded_resolution_temperature(previous)
                 self.observed_maxima[key] = observed
-                increased = True
                 print(
                     f"[{utc_now()}] {label}: high increased source={stats.source} "
                     f"latest={latest}{unit} max={observed}{unit} "
@@ -847,7 +867,7 @@ class WeatherTriggerBot:
                 f"(event={time.perf_counter() - event_started_at:.3f}s)"
             )
             return
-        if not increased:
+        if not needs_trade_check:
             self.maybe_save_state()
             print(
                 f"[{utc_now()}] {label}: timing "
@@ -863,6 +883,8 @@ class WeatherTriggerBot:
             rounded_highs_by_unit=rounded_highs_by_unit,
         )
         markets_seconds = time.perf_counter() - markets_started_at
+        for unit, observed in observed_highs_by_unit.items():
+            self.checked_maxima[event_unit_key(event, unit)] = observed
         if not markets:
             print(
                 f"[{utc_now()}] {label}: no actionable NO markets below current high "
