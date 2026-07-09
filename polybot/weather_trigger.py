@@ -657,7 +657,6 @@ class WeatherTriggerBot:
         state_path: Path,
         source: StrategySource,
         weather_hours: int,
-        trade_on_first_observation: bool,
         price_websocket_max_age: float,
         price_wait_seconds: float,
     ) -> None:
@@ -677,7 +676,6 @@ class WeatherTriggerBot:
         self.state_path = state_path
         self.source = source
         self.weather_hours = weather_hours
-        self.trade_on_first_observation = trade_on_first_observation
         self.price_websocket_max_age = price_websocket_max_age
         self.price_wait_seconds = price_wait_seconds
         self.state = load_state(state_path)
@@ -823,7 +821,7 @@ class WeatherTriggerBot:
                     f"latest={latest}{unit} max={observed}{unit} "
                     f"rounded={rounded}{unit} ({event.timezone_name})"
                 )
-                increased = self.trade_on_first_observation
+                increased = True
             elif observed > previous:
                 previous_rounded = rounded_resolution_temperature(previous)
                 self.observed_maxima[key] = observed
@@ -867,7 +865,7 @@ class WeatherTriggerBot:
         markets_seconds = time.perf_counter() - markets_started_at
         if not markets:
             print(
-                f"[{utc_now()}] {label}: high increased, no NO markets below high "
+                f"[{utc_now()}] {label}: no actionable NO markets below current high "
                 f"(markets={markets_seconds:.3f}s event={time.perf_counter() - event_started_at:.3f}s)"
             )
             self.maybe_save_state()

@@ -48,8 +48,4 @@ if [[ -n "$MAX_EVENT_LIQUIDITY" ]]; then
   ARGS+=(--max-event-liquidity "$MAX_EVENT_LIQUIDITY")
 fi
 
-if [[ "${POLYBOT_TRIGGER_TRADE_ON_START:-0}" == "1" ]]; then
-  ARGS+=(--trade-on-first-observation)
-fi
-
 "$PYTHON_BIN" -u weather_trigger_bot.py "${ARGS[@]}"
