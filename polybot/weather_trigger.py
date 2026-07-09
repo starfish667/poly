@@ -513,13 +513,13 @@ def save_state(path: Path, state: TriggerState) -> None:
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
-def rule_can_buy_no_after_high(rule: TemperatureRule, observed_high: Decimal) -> bool:
+def rule_can_buy_no_after_high(rule: TemperatureRule, rounded_high: Decimal) -> bool:
     if rule.op == "eq":
-        return observed_high > rule.low
+        return rounded_high > rule.low
     if rule.op == "range":
-        return observed_high > rule.high
+        return rounded_high > rule.high
     if rule.op == "lte":
-        return observed_high > rule.low
+        return rounded_high > rule.low
     return False
 
 
@@ -552,7 +552,7 @@ async def actionable_no_markets(
         if (
             observed_high is None
             or rounded_high is None
-            or not rule_can_buy_no_after_high(rule, observed_high)
+            or not rule_can_buy_no_after_high(rule, rounded_high)
         ):
             continue
         if snapshot.no_token_id is None:
@@ -834,7 +834,7 @@ class WeatherTriggerBot:
             key = event_unit_key(event, unit)
             previous = self.observed_maxima.get(key)
             checked = self.checked_maxima.get(key)
-            if checked is None or observed > checked:
+            if checked is None or rounded > checked:
                 needs_trade_check = True
             if previous is None:
                 self.observed_maxima[key] = observed
@@ -883,8 +883,8 @@ class WeatherTriggerBot:
             rounded_highs_by_unit=rounded_highs_by_unit,
         )
         markets_seconds = time.perf_counter() - markets_started_at
-        for unit, observed in observed_highs_by_unit.items():
-            self.checked_maxima[event_unit_key(event, unit)] = observed
+        for unit, rounded in rounded_highs_by_unit.items():
+            self.checked_maxima[event_unit_key(event, unit)] = rounded
         if not markets:
             print(
                 f"[{utc_now()}] {label}: no actionable NO markets below current high "
