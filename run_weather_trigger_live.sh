@@ -33,6 +33,7 @@ SIZE="${POLYBOT_TRIGGER_SIZE:-5}"
 SOURCE="${POLYBOT_TRIGGER_SOURCE:-auto}"
 PRICE_WEBSOCKET_MAX_AGE="${POLYBOT_TRIGGER_PRICE_WEBSOCKET_MAX_AGE:-10}"
 PRICE_WAIT_SECONDS="${POLYBOT_TRIGGER_PRICE_WAIT_SECONDS:-2}"
+STALE_RETRY_SECONDS="${POLYBOT_TRIGGER_STALE_RETRY_SECONDS:-15}"
 LOG_FILE="logs/weather-trigger-live-$(date -u +%Y%m%d-%H%M%S).log"
 PYTHON_BIN="${POLYBOT_PYTHON:-python}"
 
@@ -52,6 +53,7 @@ ARGS=(
   --source "$SOURCE"
   --price-websocket-max-age "$PRICE_WEBSOCKET_MAX_AGE"
   --price-wait-seconds "$PRICE_WAIT_SECONDS"
+  --stale-retry-seconds "$STALE_RETRY_SECONDS"
   --state weather_trigger_state.json
   --log-file "$LOG_FILE"
   --live

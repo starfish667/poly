@@ -41,6 +41,7 @@ def main() -> None:
     parser.add_argument("--weather-hours", type=int, default=72)
     parser.add_argument("--price-websocket-max-age", type=float, default=10)
     parser.add_argument("--price-wait-seconds", type=float, default=2)
+    parser.add_argument("--stale-retry-seconds", type=float, default=15)
     parser.add_argument("--log-file")
     parser.add_argument("--live", action="store_true")
     args = parser.parse_args()
@@ -67,6 +68,7 @@ def main() -> None:
         weather_hours=args.weather_hours,
         price_websocket_max_age=args.price_websocket_max_age,
         price_wait_seconds=args.price_wait_seconds,
+        stale_retry_seconds=args.stale_retry_seconds,
     )
     asyncio.run(bot.run_forever())
 

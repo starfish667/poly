@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import csv
+import gzip
+import io
 import json
 import os
 import re
@@ -48,6 +51,7 @@ TEMP_MARKET_SUFFIX = re.compile(
     flags=re.IGNORECASE,
 )
 ECMWF_OPEN_DATA_URL = "https://data.ecmwf.int/forecasts"
+AVIATION_WEATHER_METAR_CACHE_URL = "https://aviationweather.gov/data/cache/metars.cache.csv.gz"
 
 
 @dataclass
@@ -274,10 +278,13 @@ async def fetch_aviation_metars_for_stations(
         "format": "json",
         "hours": str(hours),
     }
-    async with httpx.AsyncClient(timeout=30, headers=AVIATION_WEATHER_HEADERS) as client:
-        response = await client.get(AVIATION_WEATHER_METAR_URL, params=params)
-        response.raise_for_status()
-        payload = response.json()
+    try:
+        async with httpx.AsyncClient(timeout=30, headers=AVIATION_WEATHER_HEADERS) as client:
+            response = await client.get(AVIATION_WEATHER_METAR_URL, params=params)
+            response.raise_for_status()
+            payload = response.json()
+    except Exception:
+        return {}
     if not isinstance(payload, list):
         return {}
 
@@ -289,6 +296,55 @@ async def fetch_aviation_metars_for_stations(
         if not isinstance(station_id, str):
             continue
         grouped.setdefault(station_id.upper(), []).append(item)
+    return grouped
+
+
+async def fetch_aviation_metar_cache_for_stations(
+    station_ids: list[str],
+) -> dict[str, list[dict[str, object]]]:
+    wanted = {station_id.upper() for station_id in station_ids if station_id}
+    if not wanted:
+        return {}
+
+    try:
+        async with httpx.AsyncClient(timeout=10, headers=AVIATION_WEATHER_HEADERS) as client:
+            response = await client.get(AVIATION_WEATHER_METAR_CACHE_URL)
+            response.raise_for_status()
+            compressed = response.content
+    except Exception:
+        return {}
+
+    try:
+        text = gzip.decompress(compressed).decode("utf-8", errors="replace")
+    except OSError:
+        return {}
+
+    data_lines = [
+        line
+        for line in text.splitlines()
+        if line and not line.startswith("#")
+    ]
+    if not data_lines:
+        return {}
+
+    reader = csv.DictReader(io.StringIO("\n".join(data_lines)))
+    grouped: dict[str, list[dict[str, object]]] = {}
+    for row in reader:
+        station_id = (row.get("station_id") or "").upper()
+        if station_id not in wanted:
+            continue
+        temp_c = row.get("temp_c")
+        observation_time = row.get("observation_time")
+        if not temp_c or not observation_time:
+            continue
+        grouped.setdefault(station_id, []).append(
+            {
+                "icaoId": station_id,
+                "reportTime": observation_time,
+                "temp": temp_c,
+                "rawOb": row.get("raw_text"),
+            }
+        )
     return grouped
 
 
@@ -317,6 +373,7 @@ def aviation_temperature_stats(
     *,
     target_date: date,
     local_tz: ZoneInfo,
+    source: str = "aviationweather",
 ) -> TemperatureStats | None:
     high_by_unit: dict[Unit, Decimal] = {}
     latest_by_unit: dict[Unit, Decimal] = {}
@@ -340,7 +397,7 @@ def aviation_temperature_stats(
     if not high_by_unit:
         return None
     return TemperatureStats(
-        source="aviationweather",
+        source=source,
         latest_by_unit=latest_by_unit,
         high_by_unit=high_by_unit,
     )
@@ -383,6 +440,34 @@ def history_temperature_stats(
         return None
     return TemperatureStats(
         source="weather.com",
+        latest_by_unit=latest_by_unit,
+        high_by_unit=high_by_unit,
+    )
+
+
+def best_temperature_stats(
+    *stats_items: TemperatureStats | None,
+) -> TemperatureStats | None:
+    high_by_unit: dict[Unit, Decimal] = {}
+    latest_by_unit: dict[Unit, Decimal] = {}
+    sources: set[str] = set()
+    for unit in ("C", "F"):
+        candidates = [
+            item
+            for item in stats_items
+            if item is not None and unit in item.high_by_unit
+        ]
+        if not candidates:
+            continue
+        best = max(candidates, key=lambda item: item.high_by_unit[unit])
+        high_by_unit[unit] = best.high_by_unit[unit]
+        if unit in best.latest_by_unit:
+            latest_by_unit[unit] = best.latest_by_unit[unit]
+        sources.add(best.source)
+    if not high_by_unit:
+        return None
+    return TemperatureStats(
+        source="+".join(sorted(sources)),
         latest_by_unit=latest_by_unit,
         high_by_unit=high_by_unit,
     )
@@ -439,9 +524,10 @@ async def choose_weather_source(
         ecmwf_latency = await benchmark_get(ECMWF_OPEN_DATA_URL)
 
     reason = (
-        "Weather.com/Wunderground history API is primary because it gives finer "
-        "Celsius trigger precision via Fahrenheit observations; AviationWeather "
-        "METAR is the fallback. ECMWF open data is forecast-only for this use case."
+        "Weather.com/Wunderground history, AviationWeather METAR cache, and "
+        "AviationWeather station API are fetched concurrently; the bot uses the "
+        "highest rounded observed station high. ECMWF open data is forecast-only "
+        "for this use case."
     )
     if aviation_latency is not None:
         reason += f" AviationWeather fallback benchmark latency={aviation_latency:.3f}s."
@@ -673,6 +759,7 @@ class WeatherTriggerBot:
         weather_hours: int,
         price_websocket_max_age: float,
         price_wait_seconds: float,
+        stale_retry_seconds: float,
     ) -> None:
         self.live = live
         self.city_count = city_count
@@ -692,10 +779,12 @@ class WeatherTriggerBot:
         self.weather_hours = weather_hours
         self.price_websocket_max_age = price_websocket_max_age
         self.price_wait_seconds = price_wait_seconds
+        self.stale_retry_seconds = stale_retry_seconds
         self.state = load_state(state_path)
         self.session_fired: set[str] = set()
         self.session_observed_maxima = dict(self.state.observed_maxima)
         self.session_checked_maxima = dict(self.state.checked_maxima)
+        self.stale_retry_deadlines: dict[str, float] = {}
         self.price_cache: PriceWebSocketCache | None = None
         self.price_token_ids: set[str] = set()
 
@@ -773,7 +862,8 @@ class WeatherTriggerBot:
         cycle_started_at = time.perf_counter()
         station_ids = [event.station_id for event in events]
         weather_started_at = time.perf_counter()
-        metars_by_station, history_results = await asyncio.gather(
+        cache_by_station, metars_by_station, history_results = await asyncio.gather(
+            fetch_aviation_metar_cache_for_stations(station_ids),
             fetch_aviation_metars_for_stations(
                 station_ids,
                 hours=self.weather_hours,
@@ -789,6 +879,7 @@ class WeatherTriggerBot:
             await self.process_event(
                 client,
                 event,
+                cache_by_station.get(event.station_id, []),
                 metars_by_station.get(event.station_id, []),
                 history_by_event.get(event.url, []),
             )
@@ -801,20 +892,28 @@ class WeatherTriggerBot:
         self,
         client: AsyncPublicClient,
         event: WeatherEventCandidate,
+        cached_metars: list[dict[str, object]],
         metars: list[dict[str, object]],
         history: list[dict[str, object]],
     ) -> None:
         event_started_at = time.perf_counter()
         local_tz = ZoneInfo(event.timezone_name)
         history_stats = history_temperature_stats(history)
+        cache_stats = aviation_temperature_stats(
+            cached_metars,
+            target_date=event.target_date,
+            local_tz=local_tz,
+            source="aviationweather-cache",
+        )
         aviation_stats = aviation_temperature_stats(
             metars,
             target_date=event.target_date,
             local_tz=local_tz,
         )
-        stats = history_stats or aviation_stats
+        stats = best_temperature_stats(cache_stats, history_stats, aviation_stats)
         observed_highs_by_unit: dict[Unit, Decimal] = {}
         rounded_highs_by_unit: dict[Unit, Decimal] = {}
+        trade_check_keys: set[str] = set()
         needs_trade_check = False
         label = event_label(event)
         if stats is None:
@@ -836,6 +935,7 @@ class WeatherTriggerBot:
             checked = self.checked_maxima.get(key)
             if checked is None or rounded > checked:
                 needs_trade_check = True
+                trade_check_keys.add(key)
             if previous is None:
                 self.observed_maxima[key] = observed
                 print(
@@ -883,9 +983,11 @@ class WeatherTriggerBot:
             rounded_highs_by_unit=rounded_highs_by_unit,
         )
         markets_seconds = time.perf_counter() - markets_started_at
-        for unit, rounded in rounded_highs_by_unit.items():
-            self.checked_maxima[event_unit_key(event, unit)] = rounded
         if not markets:
+            for unit, rounded in rounded_highs_by_unit.items():
+                key = event_unit_key(event, unit)
+                if key in trade_check_keys:
+                    self.checked_maxima[key] = rounded
             print(
                 f"[{utc_now()}] {label}: no actionable NO markets below current high "
                 f"(markets={markets_seconds:.3f}s event={time.perf_counter() - event_started_at:.3f}s)"
@@ -905,11 +1007,38 @@ class WeatherTriggerBot:
             live=self.live,
             fired=self.fired,
         )
+        has_stale_price = any(
+            prices.get(market.token_id) is None
+            for market in markets
+        )
         print(f"[{utc_now()}] {label}: {len(markets)} actionable NO market(s)")
         for note in notes:
             print(note)
 
         if not plans:
+            should_mark_checked = True
+            if has_stale_price and self.stale_retry_seconds > 0:
+                now = time.monotonic()
+                active_deadlines: list[float] = []
+                for key in trade_check_keys:
+                    deadline = self.stale_retry_deadlines.setdefault(
+                        key,
+                        now + self.stale_retry_seconds,
+                    )
+                    active_deadlines.append(deadline)
+                if active_deadlines and now < max(active_deadlines):
+                    should_mark_checked = False
+                    remaining = max(active_deadlines) - now
+                    print(
+                        f"[{utc_now()}] {label}: stale websocket price; "
+                        f"retrying rounded high for {remaining:.1f}s"
+                    )
+            if should_mark_checked:
+                for unit, rounded in rounded_highs_by_unit.items():
+                    key = event_unit_key(event, unit)
+                    if key in trade_check_keys:
+                        self.checked_maxima[key] = rounded
+                        self.stale_retry_deadlines.pop(key, None)
             self.maybe_save_state()
             print(
                 f"[{utc_now()}] {label}: timing "
@@ -931,6 +1060,11 @@ class WeatherTriggerBot:
             )
             if result.ok:
                 self.fired.add(f"{plan.market.slug}:NO")
+        for unit, rounded in rounded_highs_by_unit.items():
+            key = event_unit_key(event, unit)
+            if key in trade_check_keys:
+                self.checked_maxima[key] = rounded
+                self.stale_retry_deadlines.pop(key, None)
         self.maybe_save_state()
         print(
             f"[{utc_now()}] {label}: timing "
