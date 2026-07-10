@@ -302,7 +302,7 @@ def weather_local_tz(source: str) -> ZoneInfo:
     country_code = country_code_from_source(source)
     if country_code in COUNTRY_TIME_ZONES:
         return ZoneInfo(COUNTRY_TIME_ZONES[country_code])
-    return UTC_TZ
+    raise ValueError(f"Unknown local timezone for weather source: {source}")
 
 
 def temperature_day_complete(rule: TemperatureRule, *, local_tz: ZoneInfo) -> bool:

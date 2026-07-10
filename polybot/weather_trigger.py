@@ -177,7 +177,8 @@ def event_from_market(market: object) -> WeatherEventCandidate | None:
         )
         station_id = station_id_from_source(snapshot.source)
         local_tz = weather_local_tz(snapshot.source)
-    except (ValueError, KeyError):
+    except (ValueError, KeyError) as error:
+        print(f"[{utc_now()}] skip weather market {snapshot.slug}: {error}")
         return None
 
     return WeatherEventCandidate(
