@@ -51,6 +51,9 @@ TEMP_MARKET_SUFFIX = re.compile(
 )
 ECMWF_OPEN_DATA_URL = "https://data.ecmwf.int/forecasts"
 AVIATION_WEATHER_METAR_CACHE_URL = "https://aviationweather.gov/data/cache/metars.cache.csv.gz"
+NOAA_LATEST_METAR_URL = "https://tgftp.nws.noaa.gov/data/observations/metar/stations/{station}.TXT"
+RAW_METAR_TEMP_RE = re.compile(r"(?<![A-Z0-9])(M?\d{2})/(?:M?\d{2}|//)(?![A-Z0-9])")
+RAW_METAR_TENTHS_TEMP_RE = re.compile(r"(?<![A-Z0-9])T([01])(\d{3})([01])(\d{3})(?![A-Z0-9])")
 
 
 @dataclass
@@ -362,6 +365,76 @@ async def fetch_aviation_metar_cache_for_stations(
     return grouped
 
 
+def parse_noaa_metar_time(line: str) -> datetime | None:
+    raw = line.strip()
+    for fmt in ("%Y/%m/%d %H:%M", "%Y-%m-%d %H:%M"):
+        try:
+            return datetime.strptime(raw, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    return None
+
+
+def parse_raw_metar_temp_c(raw_metar: str) -> Decimal | None:
+    tenths = RAW_METAR_TENTHS_TEMP_RE.search(raw_metar)
+    if tenths is not None:
+        sign = Decimal("-1") if tenths.group(1) == "1" else Decimal("1")
+        value = Decimal(tenths.group(2)) / Decimal("10")
+        return (sign * value).quantize(Decimal("0.1"))
+
+    match = RAW_METAR_TEMP_RE.search(raw_metar)
+    if match is None:
+        return None
+    raw = match.group(1)
+    sign = Decimal("-1") if raw.startswith("M") else Decimal("1")
+    digits = raw[1:] if raw.startswith("M") else raw
+    return sign * Decimal(digits)
+
+
+def noaa_metar_observation(station_id: str, text: str) -> dict[str, object] | None:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if len(lines) < 2:
+        return None
+    observed_at = parse_noaa_metar_time(lines[0])
+    raw_metar = " ".join(lines[1:])
+    temp_c = parse_raw_metar_temp_c(raw_metar)
+    if observed_at is None or temp_c is None or " NIL" in f" {raw_metar} ":
+        return None
+    return {
+        "icaoId": station_id.upper(),
+        "reportTime": observed_at.isoformat(),
+        "temp": str(temp_c),
+        "rawOb": raw_metar,
+    }
+
+
+async def fetch_noaa_latest_metars_for_stations(
+    station_ids: list[str],
+) -> dict[str, list[dict[str, object]]]:
+    wanted = sorted({station_id.upper() for station_id in station_ids if station_id})
+    if not wanted:
+        return {}
+
+    async def fetch_one(client: httpx.AsyncClient, station_id: str) -> tuple[str, dict[str, object] | None]:
+        try:
+            response = await client.get(NOAA_LATEST_METAR_URL.format(station=station_id))
+            response.raise_for_status()
+        except Exception:
+            return station_id, None
+        return station_id, noaa_metar_observation(station_id, response.text)
+
+    grouped: dict[str, list[dict[str, object]]] = {}
+    try:
+        async with httpx.AsyncClient(timeout=5, headers=AVIATION_WEATHER_HEADERS) as client:
+            rows = await asyncio.gather(*(fetch_one(client, station_id) for station_id in wanted))
+    except Exception:
+        return {}
+    for station_id, observation in rows:
+        if observation is not None:
+            grouped[station_id] = [observation]
+    return grouped
+
+
 def aviation_temperature_points(
     observations: list[dict[str, object]],
     *,
@@ -557,10 +630,10 @@ async def choose_weather_source(
         ecmwf_latency = await benchmark_get(ECMWF_OPEN_DATA_URL)
 
     reason = (
-        "Weather.com/Wunderground history, AviationWeather METAR cache, and "
-        "AviationWeather station API are fetched concurrently; the bot uses the "
-        "highest rounded observed station high. ECMWF open data is forecast-only "
-        "for this use case."
+        "NOAA/NWS raw latest METAR, Weather.com/Wunderground history, "
+        "AviationWeather METAR cache, and AviationWeather station API are fetched "
+        "concurrently; the bot uses the highest rounded observed station high. "
+        "ECMWF open data is forecast-only for this use case."
     )
     if aviation_latency is not None:
         reason += f" AviationWeather fallback benchmark latency={aviation_latency:.3f}s."
@@ -568,7 +641,7 @@ async def choose_weather_source(
         reason += f" ECMWF endpoint benchmark latency={ecmwf_latency:.3f}s but is not eligible."
 
     return WeatherSourceDecision(
-        name="weather.com-history+aviationweather-fallback",
+        name="noaa-raw+weather.com-history+aviationweather-fallback",
         latency_seconds=aviation_latency,
         min_interval_seconds=max(0.1, poll_interval),
         reason=reason,
@@ -951,7 +1024,8 @@ class WeatherTriggerBot:
         cycle_started_at = time.perf_counter()
         station_ids = [event.station_id for event in events]
         weather_started_at = time.perf_counter()
-        cache_by_station, metars_by_station, history_by_event = await asyncio.gather(
+        noaa_by_station, cache_by_station, metars_by_station, history_by_event = await asyncio.gather(
+            fetch_noaa_latest_metars_for_stations(station_ids),
             fetch_aviation_metar_cache_for_stations(station_ids),
             fetch_aviation_metars_for_stations(
                 station_ids,
@@ -964,6 +1038,7 @@ class WeatherTriggerBot:
             await self.process_event(
                 client,
                 event,
+                noaa_by_station.get(event.station_id, []),
                 cache_by_station.get(event.station_id, []),
                 metars_by_station.get(event.station_id, []),
                 history_by_event.get(event.url, []),
@@ -977,6 +1052,7 @@ class WeatherTriggerBot:
         self,
         client: AsyncPublicClient,
         event: WeatherEventCandidate,
+        noaa_metars: list[dict[str, object]],
         cached_metars: list[dict[str, object]],
         metars: list[dict[str, object]],
         history: list[dict[str, object]],
@@ -994,6 +1070,12 @@ class WeatherTriggerBot:
             )
             return
         history_stats = history_temperature_stats(history)
+        noaa_stats = aviation_temperature_stats(
+            noaa_metars,
+            target_date=event.target_date,
+            local_tz=local_tz,
+            source="noaa-raw",
+        )
         cache_stats = aviation_temperature_stats(
             cached_metars,
             target_date=event.target_date,
@@ -1005,7 +1087,7 @@ class WeatherTriggerBot:
             target_date=event.target_date,
             local_tz=local_tz,
         )
-        stats = best_temperature_stats(cache_stats, history_stats, aviation_stats)
+        stats = best_temperature_stats(noaa_stats, cache_stats, history_stats, aviation_stats)
         observed_highs_by_unit: dict[Unit, Decimal] = {}
         rounded_highs_by_unit: dict[Unit, Decimal] = {}
         trade_check_keys: set[str] = set()
