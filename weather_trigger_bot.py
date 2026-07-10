@@ -39,6 +39,7 @@ def main() -> None:
     parser.add_argument("--state", default="weather_trigger_state.json")
     parser.add_argument("--source", choices=("auto", "aviationweather", "ecmwf"), default="auto")
     parser.add_argument("--weather-hours", type=int, default=72)
+    parser.add_argument("--history-ttl-seconds", type=float, default=30)
     parser.add_argument("--price-websocket-max-age", type=float, default=10)
     parser.add_argument("--price-wait-seconds", type=float, default=2)
     parser.add_argument("--stale-retry-seconds", type=float, default=15)
@@ -66,6 +67,7 @@ def main() -> None:
         state_path=Path(args.state),
         source=args.source,
         weather_hours=args.weather_hours,
+        history_ttl_seconds=args.history_ttl_seconds,
         price_websocket_max_age=args.price_websocket_max_age,
         price_wait_seconds=args.price_wait_seconds,
         stale_retry_seconds=args.stale_retry_seconds,

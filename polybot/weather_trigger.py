@@ -790,6 +790,7 @@ class WeatherTriggerBot:
         state_path: Path,
         source: StrategySource,
         weather_hours: int,
+        history_ttl_seconds: float,
         price_websocket_max_age: float,
         price_wait_seconds: float,
         stale_retry_seconds: float,
@@ -810,6 +811,7 @@ class WeatherTriggerBot:
         self.state_path = state_path
         self.source = source
         self.weather_hours = weather_hours
+        self.history_ttl_seconds = history_ttl_seconds
         self.price_websocket_max_age = price_websocket_max_age
         self.price_wait_seconds = price_wait_seconds
         self.stale_retry_seconds = stale_retry_seconds
@@ -820,6 +822,7 @@ class WeatherTriggerBot:
         self.stale_retry_deadlines: dict[str, float] = {}
         self.price_cache: PriceWebSocketCache | None = None
         self.price_token_ids: set[str] = set()
+        self.history_cache: dict[str, tuple[float, list[dict[str, object]]]] = {}
 
     @property
     def fired(self) -> set[str]:
@@ -869,6 +872,34 @@ class WeatherTriggerBot:
         await self.ensure_price_cache(token_ids)
         return time.perf_counter() - started_at
 
+    async def weather_history_for_events(
+        self,
+        events: list[WeatherEventCandidate],
+    ) -> dict[str, list[dict[str, object]]]:
+        now = time.monotonic()
+        results: dict[str, list[dict[str, object]]] = {}
+        stale_events: list[WeatherEventCandidate] = []
+        for event in events:
+            cached = self.history_cache.get(event.url)
+            if (
+                cached is not None
+                and self.history_ttl_seconds > 0
+                and now - cached[0] < self.history_ttl_seconds
+            ):
+                results[event.url] = cached[1]
+            else:
+                stale_events.append(event)
+
+        if stale_events:
+            histories = await asyncio.gather(
+                *(fetch_history_for_event(event) for event in stale_events)
+            )
+            fetched_at = time.monotonic()
+            for event, history in zip(stale_events, histories, strict=True):
+                self.history_cache[event.url] = (fetched_at, history)
+                results[event.url] = history
+        return results
+
     async def websocket_prices(
         self,
         markets: list[ActionableNoMarket],
@@ -895,18 +926,14 @@ class WeatherTriggerBot:
         cycle_started_at = time.perf_counter()
         station_ids = [event.station_id for event in events]
         weather_started_at = time.perf_counter()
-        cache_by_station, metars_by_station, history_results = await asyncio.gather(
+        cache_by_station, metars_by_station, history_by_event = await asyncio.gather(
             fetch_aviation_metar_cache_for_stations(station_ids),
             fetch_aviation_metars_for_stations(
                 station_ids,
                 hours=self.weather_hours,
             ),
-            asyncio.gather(*(fetch_history_for_event(event) for event in events)),
+            self.weather_history_for_events(events),
         )
-        history_by_event = {
-            event.url: history
-            for event, history in zip(events, history_results, strict=True)
-        }
         weather_seconds = time.perf_counter() - weather_started_at
         for event in events:
             await self.process_event(
