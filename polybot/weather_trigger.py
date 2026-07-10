@@ -704,8 +704,9 @@ async def no_token_ids_for_events(
                 continue
             snapshot = snapshot_from_market(market)
             if snapshot.no_token_id is not None:
-                token_ids.add(snapshot.no_token_id)
-                labels[snapshot.no_token_id] = f"{event_label(event)} NO {snapshot.question}"
+                token_id = str(snapshot.no_token_id)
+                token_ids.add(token_id)
+                labels[token_id] = f"{event_label(event)} NO {snapshot.question}"
     return token_ids, labels
 
 
@@ -855,13 +856,11 @@ class WeatherTriggerBot:
         previous_ask: Decimal | None,
         best_ask: Decimal | None,
     ) -> None:
-        if best_ask is None:
+        if previous_ask is None or best_ask is None:
             return
         previous_in_range = previous_ask is not None and previous_ask <= self.max_entry_price
         current_in_range = best_ask <= self.max_entry_price
-        if previous_ask is not None and previous_in_range == current_in_range:
-            return
-        if previous_ask is None and not current_in_range:
+        if previous_in_range == current_in_range:
             return
         direction = "enter" if current_in_range else "exit"
         label = self.price_token_labels.get(token_id, "unknown NO market")
