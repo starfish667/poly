@@ -52,11 +52,13 @@ STATION_TIME_ZONES = {
     "LEMD": "Europe/Madrid",
     "LFPB": "Europe/Paris",
     "RPLL": "Asia/Manila",
+    "SAEZ": "America/Argentina/Buenos_Aires",
     "ZSQD": "Asia/Shanghai",
     "ZUCK": "Asia/Shanghai",
 }
 COUNTRY_TIME_ZONES = {
     "br": "America/Sao_Paulo",
+    "ar": "America/Argentina/Buenos_Aires",
     "ca": "America/Toronto",
     "cn": "Asia/Shanghai",
     "de": "Europe/Berlin",
