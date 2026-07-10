@@ -694,8 +694,9 @@ async def actionable_no_markets(
 async def no_token_ids_for_events(
     client: AsyncPublicClient,
     events: list[WeatherEventCandidate],
-) -> set[str]:
+) -> tuple[set[str], dict[str, str]]:
     token_ids: set[str] = set()
+    labels: dict[str, str] = {}
     for event in events:
         event_payload = await client.get_event(url=event.url)
         for market in event_payload.markets:
@@ -704,7 +705,8 @@ async def no_token_ids_for_events(
             snapshot = snapshot_from_market(market)
             if snapshot.no_token_id is not None:
                 token_ids.add(snapshot.no_token_id)
-    return token_ids
+                labels[snapshot.no_token_id] = f"{event_label(event)} NO {snapshot.question}"
+    return token_ids, labels
 
 
 def build_no_trade_plans(
@@ -822,6 +824,7 @@ class WeatherTriggerBot:
         self.stale_retry_deadlines: dict[str, float] = {}
         self.price_cache: PriceWebSocketCache | None = None
         self.price_token_ids: set[str] = set()
+        self.price_token_labels: dict[str, str] = {}
         self.history_cache: dict[str, tuple[float, list[dict[str, object]]]] = {}
 
     @property
@@ -846,6 +849,27 @@ class WeatherTriggerBot:
             self.price_cache = None
             self.price_token_ids = set()
 
+    def log_price_watch(
+        self,
+        token_id: str,
+        previous_ask: Decimal | None,
+        best_ask: Decimal | None,
+    ) -> None:
+        if best_ask is None:
+            return
+        previous_in_range = previous_ask is not None and previous_ask <= self.max_entry_price
+        current_in_range = best_ask <= self.max_entry_price
+        if previous_ask is not None and previous_in_range == current_in_range:
+            return
+        if previous_ask is None and not current_in_range:
+            return
+        direction = "enter" if current_in_range else "exit"
+        label = self.price_token_labels.get(token_id, "unknown NO market")
+        print(
+            f"[{utc_now()}] websocket price watch {direction} <= {self.max_entry_price}: "
+            f"ask {previous_ask} -> {best_ask} token={token_id} {label}"
+        )
+
     async def ensure_price_cache(self, token_ids: set[str]) -> None:
         wanted = {str(token_id) for token_id in token_ids if token_id}
         if not wanted:
@@ -857,6 +881,7 @@ class WeatherTriggerBot:
         self.price_cache = PriceWebSocketCache(
             wanted,
             max_age_seconds=self.price_websocket_max_age,
+            on_best_ask_change=self.log_price_watch,
         )
         self.price_token_ids = wanted
         await self.price_cache.start()
@@ -868,7 +893,8 @@ class WeatherTriggerBot:
         events: list[WeatherEventCandidate],
     ) -> float:
         started_at = time.perf_counter()
-        token_ids = await no_token_ids_for_events(client, events)
+        token_ids, labels = await no_token_ids_for_events(client, events)
+        self.price_token_labels.update(labels)
         await self.ensure_price_cache(token_ids)
         return time.perf_counter() - started_at
 

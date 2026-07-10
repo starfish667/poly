@@ -4,7 +4,7 @@ import asyncio
 import time
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
-from typing import Any
+from typing import Any, Callable
 
 from polymarket import AsyncPublicClient, PriceRequest
 from polymarket.streams import MarketSpec
@@ -54,9 +54,11 @@ class PriceWebSocketCache:
         token_ids: set[str],
         *,
         max_age_seconds: float = 10.0,
+        on_best_ask_change: Callable[[str, Decimal | None, Decimal | None], None] | None = None,
     ) -> None:
         self.token_ids = {str(token_id) for token_id in token_ids if token_id}
         self.max_age_seconds = max_age_seconds
+        self.on_best_ask_change = on_best_ask_change
         self.quotes: dict[str, PriceQuote] = {}
         self._task: asyncio.Task[None] | None = None
         self._stop = asyncio.Event()
@@ -164,6 +166,7 @@ class PriceWebSocketCache:
                     token_id=getattr(change, "token_id", None),
                     best_bid=parse_decimal(getattr(change, "best_bid", None)),
                     best_ask=parse_decimal(getattr(change, "best_ask", None)),
+                    notify=True,
                 )
             return
 
@@ -173,7 +176,7 @@ class PriceWebSocketCache:
         if event_type == "book":
             best_bid = best_bid_from_levels(getattr(payload, "bids", None))
             best_ask = best_ask_from_levels(getattr(payload, "asks", None))
-        self._upsert_quote(token_id=token_id, best_bid=best_bid, best_ask=best_ask)
+        self._upsert_quote(token_id=token_id, best_bid=best_bid, best_ask=best_ask, notify=True)
 
     def _upsert_quote(
         self,
@@ -181,14 +184,19 @@ class PriceWebSocketCache:
         token_id: object,
         best_bid: Decimal | None,
         best_ask: Decimal | None,
+        notify: bool = False,
     ) -> None:
         if token_id is None:
             return
         token_text = str(token_id)
         previous = self.quotes.get(token_text)
+        previous_ask = previous.best_ask if previous else None
+        next_ask = best_ask if best_ask is not None else previous_ask
         self.quotes[token_text] = PriceQuote(
             token_id=token_text,
             best_bid=best_bid if best_bid is not None else (previous.best_bid if previous else None),
-            best_ask=best_ask if best_ask is not None else (previous.best_ask if previous else None),
+            best_ask=next_ask,
             updated_at=time.monotonic(),
         )
+        if notify and self.on_best_ask_change is not None and previous_ask != next_ask:
+            self.on_best_ask_change(token_text, previous_ask, next_ask)
