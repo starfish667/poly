@@ -31,7 +31,6 @@ from polybot.weather import (
     aviation_observation_time,
     fetch_weather_com_history,
     historical_observation_temp,
-    max_temperature_from_aviation_metars,
     parse_temperature_rule,
     rounded_resolution_temperature,
     station_id_from_source,
@@ -109,10 +108,24 @@ class TemperatureStats:
     source: str
     latest_by_unit: dict[Unit, Decimal]
     high_by_unit: dict[Unit, Decimal]
+    latest_time_by_unit: dict[Unit, datetime]
+    high_time_by_unit: dict[Unit, datetime]
 
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def format_observed_time(observed_at: datetime | None, local_tz: ZoneInfo) -> str:
+    if observed_at is None:
+        return "unknown"
+    if observed_at.tzinfo is None:
+        observed_at = observed_at.replace(tzinfo=timezone.utc)
+    local_at = observed_at.astimezone(local_tz)
+    return (
+        f"{observed_at.astimezone(timezone.utc).isoformat(timespec='seconds')} UTC/"
+        f"{local_at.isoformat(timespec='seconds')} local"
+    )
 
 
 def event_slug_from_market_slug(slug: str) -> str | None:
@@ -349,14 +362,15 @@ async def fetch_aviation_metar_cache_for_stations(
     return grouped
 
 
-def latest_aviation_temperature(
+def aviation_temperature_points(
     observations: list[dict[str, object]],
     *,
     target_date: date,
     unit: Unit,
     local_tz: ZoneInfo,
-) -> Decimal | None:
-    latest: tuple[datetime, Decimal] | None = None
+) -> tuple[tuple[Decimal, datetime] | None, tuple[Decimal, datetime] | None]:
+    high: tuple[Decimal, datetime] | None = None
+    latest: tuple[Decimal, datetime] | None = None
     for item in observations:
         observed_at = aviation_observation_time(item)
         if observed_at is None or observed_at.astimezone(local_tz).date() != target_date:
@@ -364,9 +378,11 @@ def latest_aviation_temperature(
         value = aviation_observation_temp(item, unit)
         if value is None:
             continue
-        if latest is None or observed_at > latest[0]:
-            latest = (observed_at, value)
-    return latest[1] if latest is not None else None
+        if high is None or value > high[0]:
+            high = (value, observed_at)
+        if latest is None or observed_at > latest[1]:
+            latest = (value, observed_at)
+    return high, latest
 
 
 def aviation_temperature_stats(
@@ -378,47 +394,30 @@ def aviation_temperature_stats(
 ) -> TemperatureStats | None:
     high_by_unit: dict[Unit, Decimal] = {}
     latest_by_unit: dict[Unit, Decimal] = {}
+    high_time_by_unit: dict[Unit, datetime] = {}
+    latest_time_by_unit: dict[Unit, datetime] = {}
     for unit in ("C", "F"):
-        high = max_temperature_from_aviation_metars(
+        high_point, latest_point = aviation_temperature_points(
             observations,
             target_date=target_date,
             unit=unit,
             local_tz=local_tz,
         )
-        latest = latest_aviation_temperature(
-            observations,
-            target_date=target_date,
-            unit=unit,
-            local_tz=local_tz,
-        )
-        if high is not None:
-            high_by_unit[unit] = high
-        if latest is not None:
-            latest_by_unit[unit] = latest
+        if high_point is not None:
+            high_by_unit[unit] = high_point[0]
+            high_time_by_unit[unit] = high_point[1]
+        if latest_point is not None:
+            latest_by_unit[unit] = latest_point[0]
+            latest_time_by_unit[unit] = latest_point[1]
     if not high_by_unit:
         return None
     return TemperatureStats(
         source=source,
         latest_by_unit=latest_by_unit,
         high_by_unit=high_by_unit,
+        latest_time_by_unit=latest_time_by_unit,
+        high_time_by_unit=high_time_by_unit,
     )
-
-
-def latest_history_temperature(
-    observations: list[dict[str, object]],
-    unit: Unit,
-) -> Decimal | None:
-    latest: tuple[int, Decimal] | None = None
-    for item in observations:
-        observed_at = item.get("valid_time_gmt")
-        if not isinstance(observed_at, int):
-            continue
-        value = historical_observation_temp(item, unit)
-        if value is None:
-            continue
-        if latest is None or observed_at > latest[0]:
-            latest = (observed_at, value)
-    return latest[1] if latest is not None else None
 
 
 def history_temperature_stats(
@@ -426,23 +425,37 @@ def history_temperature_stats(
 ) -> TemperatureStats | None:
     high_by_unit: dict[Unit, Decimal] = {}
     latest_by_unit: dict[Unit, Decimal] = {}
+    high_time_by_unit: dict[Unit, datetime] = {}
+    latest_time_by_unit: dict[Unit, datetime] = {}
     for unit in ("C", "F"):
-        values = [
-            value
-            for item in observations
-            if (value := historical_observation_temp(item, unit)) is not None
-        ]
-        latest = latest_history_temperature(observations, unit)
-        if values:
-            high_by_unit[unit] = max(values)
-        if latest is not None:
-            latest_by_unit[unit] = latest
+        high_point: tuple[Decimal, datetime] | None = None
+        latest_point: tuple[Decimal, datetime] | None = None
+        for item in observations:
+            observed_at = item.get("valid_time_gmt")
+            if not isinstance(observed_at, int):
+                continue
+            value = historical_observation_temp(item, unit)
+            if value is None:
+                continue
+            observed_dt = datetime.fromtimestamp(observed_at, tz=timezone.utc)
+            if high_point is None or value > high_point[0]:
+                high_point = (value, observed_dt)
+            if latest_point is None or observed_dt > latest_point[1]:
+                latest_point = (value, observed_dt)
+        if high_point is not None:
+            high_by_unit[unit] = high_point[0]
+            high_time_by_unit[unit] = high_point[1]
+        if latest_point is not None:
+            latest_by_unit[unit] = latest_point[0]
+            latest_time_by_unit[unit] = latest_point[1]
     if not high_by_unit:
         return None
     return TemperatureStats(
         source="weather.com",
         latest_by_unit=latest_by_unit,
         high_by_unit=high_by_unit,
+        latest_time_by_unit=latest_time_by_unit,
+        high_time_by_unit=high_time_by_unit,
     )
 
 
@@ -451,6 +464,8 @@ def best_temperature_stats(
 ) -> TemperatureStats | None:
     high_by_unit: dict[Unit, Decimal] = {}
     latest_by_unit: dict[Unit, Decimal] = {}
+    high_time_by_unit: dict[Unit, datetime] = {}
+    latest_time_by_unit: dict[Unit, datetime] = {}
     sources: set[str] = set()
     for unit in ("C", "F"):
         candidates = [
@@ -462,8 +477,23 @@ def best_temperature_stats(
             continue
         best = max(candidates, key=lambda item: item.high_by_unit[unit])
         high_by_unit[unit] = best.high_by_unit[unit]
-        if unit in best.latest_by_unit:
-            latest_by_unit[unit] = best.latest_by_unit[unit]
+        if unit in best.high_time_by_unit:
+            high_time_by_unit[unit] = best.high_time_by_unit[unit]
+        latest_candidates = [
+            item
+            for item in stats_items
+            if item is not None
+            and unit in item.latest_by_unit
+            and unit in item.latest_time_by_unit
+        ]
+        if latest_candidates:
+            latest = max(
+                latest_candidates,
+                key=lambda item: item.latest_time_by_unit[unit],
+            )
+            latest_by_unit[unit] = latest.latest_by_unit[unit]
+            latest_time_by_unit[unit] = latest.latest_time_by_unit[unit]
+            sources.add(latest.source)
         sources.add(best.source)
     if not high_by_unit:
         return None
@@ -471,6 +501,8 @@ def best_temperature_stats(
         source="+".join(sorted(sources)),
         latest_by_unit=latest_by_unit,
         high_by_unit=high_by_unit,
+        latest_time_by_unit=latest_time_by_unit,
+        high_time_by_unit=high_time_by_unit,
     )
 
 
@@ -899,6 +931,16 @@ class WeatherTriggerBot:
     ) -> None:
         event_started_at = time.perf_counter()
         local_tz = ZoneInfo(event.timezone_name)
+        label = event_label(event)
+        local_now = datetime.now(timezone.utc).astimezone(local_tz)
+        if local_now.date() < event.target_date:
+            print(
+                f"[{utc_now()}] {label}: skip before local target date "
+                f"local_now={local_now.isoformat(timespec='seconds')} "
+                f"target_date={event.target_date.isoformat()} "
+                f"(event={time.perf_counter() - event_started_at:.3f}s)"
+            )
+            return
         history_stats = history_temperature_stats(history)
         cache_stats = aviation_temperature_stats(
             cached_metars,
@@ -916,7 +958,6 @@ class WeatherTriggerBot:
         rounded_highs_by_unit: dict[Unit, Decimal] = {}
         trade_check_keys: set[str] = set()
         needs_trade_check = False
-        label = event_label(event)
         if stats is None:
             print(
                 f"[{utc_now()}] {label}: waiting for first local-day weather observation "
@@ -928,6 +969,8 @@ class WeatherTriggerBot:
             if observed is None:
                 continue
             latest = stats.latest_by_unit.get(unit)
+            latest_time = stats.latest_time_by_unit.get(unit)
+            high_time = stats.high_time_by_unit.get(unit)
             rounded = rounded_resolution_temperature(observed)
             observed_highs_by_unit[unit] = observed
             rounded_highs_by_unit[unit] = rounded
@@ -942,7 +985,10 @@ class WeatherTriggerBot:
                 print(
                     f"[{utc_now()}] {label}: baseline source={stats.source} "
                     f"latest={latest}{unit} max={observed}{unit} "
-                    f"rounded={rounded}{unit} ({event.timezone_name})"
+                    f"rounded={rounded}{unit} latest_at="
+                    f"{format_observed_time(latest_time, local_tz)} max_at="
+                    f"{format_observed_time(high_time, local_tz)} "
+                    f"({event.timezone_name})"
                 )
             elif observed > previous:
                 previous_rounded = rounded_resolution_temperature(previous)
@@ -951,6 +997,8 @@ class WeatherTriggerBot:
                     f"[{utc_now()}] {label}: high increased source={stats.source} "
                     f"latest={latest}{unit} max={observed}{unit} "
                     f"previous_max={previous}{unit} "
+                    f"latest_at={format_observed_time(latest_time, local_tz)} "
+                    f"max_at={format_observed_time(high_time, local_tz)} "
                     f"(rounded {previous_rounded}{unit} -> {rounded}{unit})"
                 )
             else:
@@ -959,6 +1007,8 @@ class WeatherTriggerBot:
                     f"[{utc_now()}] {label}: no increase source={stats.source} "
                     f"latest={latest}{unit} max={observed}{unit} "
                     f"previous_max={previous}{unit} "
+                    f"latest_at={format_observed_time(latest_time, local_tz)} "
+                    f"max_at={format_observed_time(high_time, local_tz)} "
                     f"(rounded {rounded}{unit} <= {previous_rounded}{unit})"
                 )
 
