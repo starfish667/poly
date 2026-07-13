@@ -50,6 +50,11 @@ def main() -> None:
     parser.add_argument("--yes-size", type=decimal_arg, default=Decimal("5"))
     parser.add_argument("--price-websocket-max-age", type=float, default=10)
     parser.add_argument("--price-wait-seconds", type=float, default=2)
+    parser.add_argument("--auto-discover", action="store_true")
+    parser.add_argument("--auto-discover-pages", type=int, default=4)
+    parser.add_argument("--auto-discover-page-size", type=int, default=40)
+    parser.add_argument("--auto-discover-lookahead-days", type=float, default=14)
+    parser.add_argument("--auto-discover-grace-seconds", type=float, default=21600)
     parser.add_argument("--log-file")
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--live", action="store_true")
@@ -79,6 +84,11 @@ def main() -> None:
         yes_size=args.yes_size,
         price_websocket_max_age=args.price_websocket_max_age,
         price_wait_seconds=args.price_wait_seconds,
+        auto_discover=args.auto_discover,
+        auto_discover_pages=args.auto_discover_pages,
+        auto_discover_page_size=args.auto_discover_page_size,
+        auto_discover_lookahead_days=args.auto_discover_lookahead_days,
+        auto_discover_grace_seconds=args.auto_discover_grace_seconds,
         once=args.once,
     )
     asyncio.run(bot.run_forever())

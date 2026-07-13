@@ -29,6 +29,12 @@ DEFAULT_EVENT_URL = (
     "https://polymarket.com/event/"
     "how-many-6pt5-or-above-earthquakes-july-6-july-12-20260702194353908"
 )
+EARTHQUAKE_SEARCH_QUERIES = (
+    "6.5 or above earthquakes",
+    "6.5 earthquakes",
+    "earthquakes July",
+    "how many earthquakes",
+)
 USGS_EVENT_QUERY_URL = "https://earthquake.usgs.gov/fdsnws/event/1/query"
 EASTERN_TZ = ZoneInfo("America/New_York")
 UTC_TZ = ZoneInfo("UTC")
@@ -131,6 +137,24 @@ class EarthquakeTriggerState:
     last_count: int | None
     known_event_ids: set[str]
     final_yes_bought: bool
+    event_url: str | None = None
+
+
+@dataclass(frozen=True)
+class EarthquakeEventCandidate:
+    url: str
+    title: str
+    rule: EarthquakeRule
+    markets: list[EarthquakeMarket]
+
+    @property
+    def sort_key(self) -> tuple[int, datetime]:
+        now = datetime.now(timezone.utc)
+        if self.rule.start_utc <= now <= self.rule.end_utc:
+            return (0, self.rule.start_utc)
+        if now < self.rule.start_utc:
+            return (1, self.rule.start_utc)
+        return (2, self.rule.end_utc)
 
 
 def utc_now() -> str:
@@ -310,6 +334,110 @@ def text_from_event_payload(event_payload: object) -> str:
     return "\n".join(pieces)
 
 
+def event_url_from_payload(event_payload: object) -> str | None:
+    slug = getattr(event_payload, "slug", None)
+    if not slug:
+        return None
+    return f"https://polymarket.com/event/{slug}"
+
+
+def event_title_from_payload(event_payload: object) -> str:
+    return str(
+        getattr(event_payload, "title", None)
+        or getattr(event_payload, "slug", None)
+        or "earthquake event"
+    )
+
+
+def event_is_open(event_payload: object) -> bool:
+    state = getattr(event_payload, "state", None)
+    if state is None:
+        return True
+    if getattr(state, "closed", None) or getattr(state, "archived", None):
+        return False
+    if getattr(state, "active", None) is False:
+        return False
+    return True
+
+
+def candidate_from_event_payload(
+    event_payload: object,
+    *,
+    expected_min_magnitude: Decimal,
+    now: datetime,
+    lookahead_seconds: float,
+    grace_seconds: float,
+) -> EarthquakeEventCandidate | None:
+    if not event_is_open(event_payload):
+        return None
+    url = event_url_from_payload(event_payload)
+    if url is None:
+        return None
+    text = text_from_event_payload(event_payload)
+    lower_text = text.lower()
+    if "earthquake" not in lower_text:
+        return None
+    rule = parse_rule_from_text(text)
+    if rule is None:
+        return None
+    if rule.min_magnitude != expected_min_magnitude:
+        return None
+    if rule.end_utc.timestamp() + grace_seconds < now.timestamp():
+        return None
+    if rule.start_utc.timestamp() > now.timestamp() + lookahead_seconds:
+        return None
+    markets = markets_from_event_payload(event_payload)
+    if len(markets) < 2:
+        return None
+    return EarthquakeEventCandidate(
+        url=url,
+        title=event_title_from_payload(event_payload),
+        rule=rule,
+        markets=markets,
+    )
+
+
+async def discover_earthquake_event(
+    client: AsyncPublicClient,
+    *,
+    expected_min_magnitude: Decimal,
+    pages: int,
+    page_size: int,
+    lookahead_days: float,
+    grace_seconds: float,
+) -> EarthquakeEventCandidate | None:
+    now = datetime.now(timezone.utc)
+    lookahead_seconds = lookahead_days * 86400
+    candidates: dict[str, EarthquakeEventCandidate] = {}
+    for query in EARTHQUAKE_SEARCH_QUERIES:
+        paginator = client.search(
+            q=query,
+            events_status="active",
+            sort="volume",
+            page_size=page_size,
+        )
+        page_count = 0
+        async for page in paginator:
+            page_count += 1
+            for result in page.items:
+                for event in result.events:
+                    candidate = candidate_from_event_payload(
+                        event,
+                        expected_min_magnitude=expected_min_magnitude,
+                        now=now,
+                        lookahead_seconds=lookahead_seconds,
+                        grace_seconds=grace_seconds,
+                    )
+                    if candidate is not None:
+                        candidates[candidate.url] = candidate
+            if page_count >= pages:
+                break
+
+    if not candidates:
+        return None
+    return sorted(candidates.values(), key=lambda item: item.sort_key)[0]
+
+
 def load_state(path: Path) -> EarthquakeTriggerState:
     if not path.exists():
         return EarthquakeTriggerState(
@@ -317,6 +445,7 @@ def load_state(path: Path) -> EarthquakeTriggerState:
             last_count=None,
             known_event_ids=set(),
             final_yes_bought=False,
+            event_url=None,
         )
     try:
         raw = json.loads(path.read_text(encoding="utf-8-sig"))
@@ -326,6 +455,7 @@ def load_state(path: Path) -> EarthquakeTriggerState:
             last_count=None,
             known_event_ids=set(),
             final_yes_bought=False,
+            event_url=None,
         )
     if not isinstance(raw, dict):
         return EarthquakeTriggerState(
@@ -333,6 +463,7 @@ def load_state(path: Path) -> EarthquakeTriggerState:
             last_count=None,
             known_event_ids=set(),
             final_yes_bought=False,
+            event_url=None,
         )
     fired = raw.get("fired")
     known_event_ids = raw.get("known_event_ids")
@@ -350,6 +481,7 @@ def load_state(path: Path) -> EarthquakeTriggerState:
             else set()
         ),
         final_yes_bought=bool(raw.get("final_yes_bought", False)),
+        event_url=str(raw["event_url"]) if raw.get("event_url") else None,
     )
 
 
@@ -360,6 +492,7 @@ def save_state(path: Path, state: EarthquakeTriggerState) -> None:
         "last_count": state.last_count,
         "known_event_ids": sorted(state.known_event_ids),
         "final_yes_bought": state.final_yes_bought,
+        "event_url": state.event_url,
     }
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
@@ -503,6 +636,11 @@ class EarthquakeTriggerBot:
         yes_size: Decimal,
         price_websocket_max_age: float,
         price_wait_seconds: float,
+        auto_discover: bool,
+        auto_discover_pages: int,
+        auto_discover_page_size: int,
+        auto_discover_lookahead_days: float,
+        auto_discover_grace_seconds: float,
         once: bool = False,
     ) -> None:
         self.event_url = event_url
@@ -525,6 +663,11 @@ class EarthquakeTriggerBot:
         self.yes_size = yes_size
         self.price_websocket_max_age = price_websocket_max_age
         self.price_wait_seconds = price_wait_seconds
+        self.auto_discover = auto_discover
+        self.auto_discover_pages = auto_discover_pages
+        self.auto_discover_page_size = auto_discover_page_size
+        self.auto_discover_lookahead_days = auto_discover_lookahead_days
+        self.auto_discover_grace_seconds = auto_discover_grace_seconds
         self.once = once
         self.state = load_state(state_path)
         self.session_state = EarthquakeTriggerState(
@@ -532,6 +675,7 @@ class EarthquakeTriggerBot:
             last_count=self.state.last_count,
             known_event_ids=set(self.state.known_event_ids),
             final_yes_bought=self.state.final_yes_bought,
+            event_url=self.state.event_url,
         )
         self.price_cache: PriceWebSocketCache | None = None
         self.price_token_ids: set[str] = set()
@@ -543,6 +687,24 @@ class EarthquakeTriggerBot:
     def maybe_save_state(self) -> None:
         if self.live:
             save_state(self.state_path, self.state)
+
+    def activate_event(self, event_url: str) -> None:
+        state = self.active_state
+        if state.event_url is None:
+            state.event_url = event_url
+            self.maybe_save_state()
+            return
+        if state.event_url == event_url:
+            return
+        print(
+            f"[{utc_now()}] switching earthquake event: "
+            f"{state.event_url} -> {event_url}"
+        )
+        state.event_url = event_url
+        state.last_count = None
+        state.known_event_ids = set()
+        state.final_yes_bought = False
+        self.maybe_save_state()
 
     async def close_price_cache(self) -> None:
         if self.price_cache is not None:
@@ -598,8 +760,10 @@ class EarthquakeTriggerBot:
     async def load_event_setup(
         self,
         client: AsyncPublicClient,
+        event_url: str,
     ) -> tuple[EarthquakeRule, list[EarthquakeMarket]]:
-        event_payload = await client.get_event(url=self.event_url)
+        self.activate_event(event_url)
+        event_payload = await client.get_event(url=event_url)
         text = text_from_event_payload(event_payload)
         parsed_rule = parse_rule_from_text(text)
         min_magnitude = self.min_magnitude
@@ -631,13 +795,44 @@ class EarthquakeTriggerBot:
             f"[{utc_now()}] event setup: M{rule.min_magnitude}+ "
             f"{rule.start_utc.isoformat(timespec='seconds')} -> "
             f"{rule.end_utc.isoformat(timespec='seconds')} UTC "
-            f"source={rule.source_text}"
+            f"source={rule.source_text} url={event_url}"
         )
         print(
             f"[{utc_now()}] markets: "
             + ", ".join(f"{market.bucket.label}" for market in markets)
         )
         return rule, markets
+
+    async def discover_event_url(self, client: AsyncPublicClient) -> str | None:
+        expected_min_magnitude = self.min_magnitude or Decimal("6.5")
+        candidate = await discover_earthquake_event(
+            client,
+            expected_min_magnitude=expected_min_magnitude,
+            pages=self.auto_discover_pages,
+            page_size=self.auto_discover_page_size,
+            lookahead_days=self.auto_discover_lookahead_days,
+            grace_seconds=self.auto_discover_grace_seconds,
+        )
+        if candidate is None:
+            print(
+                f"[{utc_now()}] auto-discovery found no eligible M"
+                f"{expected_min_magnitude}+ earthquake event"
+            )
+            return None
+        print(
+            f"[{utc_now()}] auto-discovery selected {candidate.title}: "
+            f"M{candidate.rule.min_magnitude}+ "
+            f"{candidate.rule.start_utc.isoformat(timespec='seconds')} -> "
+            f"{candidate.rule.end_utc.isoformat(timespec='seconds')} UTC "
+            f"url={candidate.url}"
+        )
+        return candidate.url
+
+    def rule_is_expired_for_auto_discovery(self, rule: EarthquakeRule | None) -> bool:
+        if rule is None:
+            return True
+        now = datetime.now(timezone.utc).timestamp()
+        return now > rule.end_utc.timestamp() + self.auto_discover_grace_seconds
 
     async def execute_candidates(
         self,
@@ -853,13 +1048,35 @@ class EarthquakeTriggerBot:
         rule: EarthquakeRule | None = None
         markets: list[EarthquakeMarket] = []
         next_market_refresh = 0.0
+        active_event_url: str | None = self.event_url
         try:
             async with AsyncPublicClient() as client:
                 while True:
                     now = time.monotonic()
                     if rule is None or now >= next_market_refresh:
                         setup_started_at = time.perf_counter()
-                        rule, markets = await self.load_event_setup(client)
+                        if self.auto_discover:
+                            discovered_url = await self.discover_event_url(client)
+                            if discovered_url is not None:
+                                active_event_url = discovered_url
+                            elif self.rule_is_expired_for_auto_discovery(rule):
+                                rule = None
+                                markets = []
+                                active_event_url = None
+                                next_market_refresh = (
+                                    time.monotonic() + self.market_refresh_interval
+                                )
+                                print(
+                                    f"[{utc_now()}] no current earthquake event; "
+                                    "waiting for next discovery"
+                                )
+                                if self.once:
+                                    return
+                                await asyncio.sleep(self.poll_interval)
+                                continue
+                        if active_event_url is None:
+                            raise RuntimeError("No earthquake event URL is configured")
+                        rule, markets = await self.load_event_setup(client, active_event_url)
                         next_market_refresh = time.monotonic() + self.market_refresh_interval
                         print(
                             f"[{utc_now()}] market refresh timing: "
