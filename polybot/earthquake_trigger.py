@@ -1053,7 +1053,7 @@ class EarthquakeTriggerBot:
             async with AsyncPublicClient() as client:
                 while True:
                     now = time.monotonic()
-                    if rule is None or now >= next_market_refresh:
+                    if now >= next_market_refresh:
                         setup_started_at = time.perf_counter()
                         if self.auto_discover:
                             discovered_url = await self.discover_event_url(client)
@@ -1082,6 +1082,12 @@ class EarthquakeTriggerBot:
                             f"[{utc_now()}] market refresh timing: "
                             f"{time.perf_counter() - setup_started_at:.3f}s"
                         )
+
+                    if rule is None or not markets:
+                        if self.once:
+                            return
+                        await asyncio.sleep(self.poll_interval)
+                        continue
 
                     try:
                         await self.run_once(rule=rule, markets=markets)
