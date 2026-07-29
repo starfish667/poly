@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import re
 import time
@@ -38,6 +39,10 @@ EARTHQUAKE_SEARCH_QUERIES = (
 USGS_EVENT_QUERY_URL = "https://earthquake.usgs.gov/fdsnws/event/1/query"
 EASTERN_TZ = ZoneInfo("America/New_York")
 UTC_TZ = ZoneInfo("UTC")
+EARTH_RADIUS_KM = 6371.0088
+USGS_DUPLICATE_TIME_SECONDS = 2 * 60
+USGS_DUPLICATE_DISTANCE_KM = 100.0
+USGS_DUPLICATE_MAGNITUDE_WINDOW = Decimal("1.0")
 
 MONTHS = {
     "jan": 1,
@@ -107,6 +112,8 @@ class EarthquakeEvent:
     place: str
     magnitude: Decimal
     observed_at: datetime
+    latitude: float | None
+    longitude: float | None
     updated_at: datetime | None
     status: str | None
 
@@ -116,6 +123,7 @@ class EarthquakeSnapshot:
     count: int
     events: list[EarthquakeEvent]
     fetched_at: datetime
+    raw_count: int | None = None
 
     @property
     def latest_update(self) -> datetime | None:
@@ -503,6 +511,91 @@ def usgs_time(value: object) -> datetime | None:
     return datetime.fromtimestamp(float(value) / 1000, tz=timezone.utc)
 
 
+def usgs_coordinates(feature: dict[str, object]) -> tuple[float | None, float | None]:
+    geometry = feature.get("geometry")
+    if not isinstance(geometry, dict):
+        return None, None
+    coordinates = geometry.get("coordinates")
+    if not isinstance(coordinates, (list, tuple)) or len(coordinates) < 2:
+        return None, None
+    try:
+        longitude = float(coordinates[0])
+        latitude = float(coordinates[1])
+    except (TypeError, ValueError):
+        return None, None
+    if not (-90 <= latitude <= 90 and -180 <= longitude <= 180):
+        return None, None
+    return latitude, longitude
+
+
+def distance_km(
+    left_latitude: float,
+    left_longitude: float,
+    right_latitude: float,
+    right_longitude: float,
+) -> float:
+    left_latitude_rad = math.radians(left_latitude)
+    right_latitude_rad = math.radians(right_latitude)
+    delta_latitude = math.radians(right_latitude - left_latitude)
+    delta_longitude = math.radians(right_longitude - left_longitude)
+    haversine = (
+        math.sin(delta_latitude / 2) ** 2
+        + math.cos(left_latitude_rad)
+        * math.cos(right_latitude_rad)
+        * math.sin(delta_longitude / 2) ** 2
+    )
+    return 2 * EARTH_RADIUS_KM * math.asin(min(1.0, math.sqrt(haversine)))
+
+
+def looks_like_same_earthquake(left: EarthquakeEvent, right: EarthquakeEvent) -> bool:
+    time_delta = abs((left.observed_at - right.observed_at).total_seconds())
+    if time_delta > USGS_DUPLICATE_TIME_SECONDS:
+        return False
+    if abs(left.magnitude - right.magnitude) > USGS_DUPLICATE_MAGNITUDE_WINDOW:
+        return False
+    if (
+        left.latitude is None
+        or left.longitude is None
+        or right.latitude is None
+        or right.longitude is None
+    ):
+        return False
+    return (
+        distance_km(left.latitude, left.longitude, right.latitude, right.longitude)
+        <= USGS_DUPLICATE_DISTANCE_KM
+    )
+
+
+def earthquake_event_rank(event: EarthquakeEvent) -> tuple[bool, datetime, Decimal]:
+    updated_at = event.updated_at or datetime.min.replace(tzinfo=timezone.utc)
+    return (event.status == "reviewed", updated_at, event.magnitude)
+
+
+def deduplicate_earthquakes(events: list[EarthquakeEvent]) -> list[EarthquakeEvent]:
+    unique_events: list[EarthquakeEvent] = []
+    for event in sorted(events, key=lambda item: item.observed_at):
+        match_index = next(
+            (
+                index
+                for index, existing in enumerate(unique_events)
+                if looks_like_same_earthquake(existing, event)
+            ),
+            None,
+        )
+        if match_index is None:
+            unique_events.append(event)
+            continue
+        if earthquake_event_rank(event) > earthquake_event_rank(unique_events[match_index]):
+            unique_events[match_index] = event
+    return sorted(unique_events, key=lambda item: item.observed_at)
+
+
+def raw_count_suffix(snapshot: EarthquakeSnapshot) -> str:
+    if snapshot.raw_count is None or snapshot.raw_count == snapshot.count:
+        return ""
+    return f" raw_usgs_count={snapshot.raw_count}"
+
+
 def iso_for_usgs(value: datetime) -> str:
     return value.astimezone(timezone.utc).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%S")
 
@@ -551,6 +644,7 @@ async def fetch_usgs_earthquakes(
         event_id = str(feature.get("id") or properties.get("code") or properties.get("ids") or "")
         if not event_id:
             continue
+        latitude, longitude = usgs_coordinates(feature)
         events.append(
             EarthquakeEvent(
                 event_id=event_id,
@@ -559,15 +653,19 @@ async def fetch_usgs_earthquakes(
                 place=str(properties.get("place") or ""),
                 magnitude=magnitude,
                 observed_at=observed_at,
+                latitude=latitude,
+                longitude=longitude,
                 updated_at=usgs_time(properties.get("updated")),
                 status=str(properties.get("status")) if properties.get("status") else None,
             )
         )
+    unique_events = deduplicate_earthquakes(events)
 
     return EarthquakeSnapshot(
-        count=len(events),
-        events=events,
+        count=len(unique_events),
+        events=unique_events,
         fetched_at=datetime.now(timezone.utc),
+        raw_count=len(events),
     )
 
 
@@ -925,7 +1023,8 @@ class EarthquakeTriggerBot:
             state.known_event_ids = current_ids
             self.maybe_save_state()
             print(
-                f"[{utc_now()}] earthquake baseline count={current_count}; "
+                f"[{utc_now()}] earthquake baseline count={current_count}"
+                f"{raw_count_suffix(snapshot)}; "
                 f"{latest_event_line(snapshot)}"
             )
             if not self.trade_on_start or current_count == 0:
@@ -934,7 +1033,8 @@ class EarthquakeTriggerBot:
         elif current_count > previous_count:
             print(
                 f"[{utc_now()}] earthquake count increased "
-                f"{previous_count} -> {current_count}; new_ids={sorted(new_ids)}; "
+                f"{previous_count} -> {current_count}{raw_count_suffix(snapshot)}; "
+                f"new_ids={sorted(new_ids)}; "
                 f"{latest_event_line(snapshot)}"
             )
             state.last_count = current_count
@@ -943,7 +1043,8 @@ class EarthquakeTriggerBot:
         elif current_count < previous_count:
             print(
                 f"[{utc_now()}] earthquake count decreased "
-                f"{previous_count} -> {current_count}; likely USGS revision; "
+                f"{previous_count} -> {current_count}{raw_count_suffix(snapshot)}; "
+                f"likely USGS revision; "
                 f"{latest_event_line(snapshot)}"
             )
             state.last_count = current_count
