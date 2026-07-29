@@ -54,6 +54,8 @@ AVIATION_WEATHER_METAR_CACHE_URL = "https://aviationweather.gov/data/cache/metar
 NOAA_LATEST_METAR_URL = "https://tgftp.nws.noaa.gov/data/observations/metar/stations/{station}.TXT"
 RAW_METAR_TEMP_RE = re.compile(r"(?<![A-Z0-9])(M?\d{2})/(?:M?\d{2}|//)(?![A-Z0-9])")
 RAW_METAR_TENTHS_TEMP_RE = re.compile(r"(?<![A-Z0-9])T([01])(\d{3})([01])(\d{3})(?![A-Z0-9])")
+POLYMARKET_EVENT_RETRIES = 3
+POLYMARKET_EVENT_RETRY_BASE_SECONDS = 0.5
 
 
 @dataclass
@@ -715,6 +717,31 @@ def rule_can_buy_no_after_high(rule: TemperatureRule, rounded_high: Decimal) -> 
     return False
 
 
+async def get_event_with_retries(
+    client: AsyncPublicClient,
+    *,
+    url: str,
+    label: str,
+) -> object | None:
+    for attempt in range(1, POLYMARKET_EVENT_RETRIES + 1):
+        try:
+            return await client.get_event(url=url)
+        except Exception as error:
+            if attempt >= POLYMARKET_EVENT_RETRIES:
+                print(
+                    f"[{utc_now()}] skip event after {attempt} get_event failure(s): "
+                    f"{label} {type(error).__name__}: {error}"
+                )
+                return None
+            delay = POLYMARKET_EVENT_RETRY_BASE_SECONDS * attempt
+            print(
+                f"[{utc_now()}] retry get_event {attempt}/{POLYMARKET_EVENT_RETRIES}: "
+                f"{label} {type(error).__name__}: {error}"
+            )
+            await asyncio.sleep(delay)
+    return None
+
+
 async def actionable_no_markets(
     client: AsyncPublicClient,
     event: WeatherEventCandidate,
@@ -722,7 +749,13 @@ async def actionable_no_markets(
     observed_highs_by_unit: dict[Unit, Decimal],
     rounded_highs_by_unit: dict[Unit, Decimal],
 ) -> list[ActionableNoMarket]:
-    event_payload = await client.get_event(url=event.url)
+    event_payload = await get_event_with_retries(
+        client,
+        url=event.url,
+        label=event_label(event),
+    )
+    if event_payload is None:
+        return []
     markets: list[ActionableNoMarket] = []
     for market in event_payload.markets:
         if not is_tradeable_weather_market(market):
@@ -771,7 +804,13 @@ async def no_token_ids_for_events(
     token_ids: set[str] = set()
     labels: dict[str, str] = {}
     for event in events:
-        event_payload = await client.get_event(url=event.url)
+        event_payload = await get_event_with_retries(
+            client,
+            url=event.url,
+            label=event_label(event),
+        )
+        if event_payload is None:
+            continue
         for market in event_payload.markets:
             if not is_tradeable_weather_market(market):
                 continue
@@ -1270,36 +1309,48 @@ class WeatherTriggerBot:
                     now = time.monotonic()
                     if now >= next_discovery:
                         discovery_started_at = time.perf_counter()
-                        events = await discover_weather_events(
-                            client,
-                            city_count=self.city_count,
-                            pages=self.pages,
-                            page_size=self.page_size,
-                            lookahead_days=self.lookahead_days,
-                            min_liquidity=self.min_liquidity,
-                            max_event_volume=self.max_event_volume,
-                            max_event_liquidity=self.max_event_liquidity,
-                        )
-                        discovery_seconds = time.perf_counter() - discovery_started_at
-                        if not events:
-                            print(
-                                f"[{utc_now()}] discovery found no eligible weather events "
-                                f"(discovery={discovery_seconds:.3f}s)"
+                        try:
+                            discovered_events = await discover_weather_events(
+                                client,
+                                city_count=self.city_count,
+                                pages=self.pages,
+                                page_size=self.page_size,
+                                lookahead_days=self.lookahead_days,
+                                min_liquidity=self.min_liquidity,
+                                max_event_volume=self.max_event_volume,
+                                max_event_liquidity=self.max_event_liquidity,
                             )
-                        else:
-                            print(
-                                f"[{utc_now()}] monitoring {len(events)} weather event(s) "
-                                f"(discovery={discovery_seconds:.3f}s):"
-                            )
-                            for event in events:
+                            events = discovered_events
+                            discovery_seconds = time.perf_counter() - discovery_started_at
+                            if not events:
                                 print(
-                                    f"  {event.city} {event.target_date} {event.station_id} "
-                                    f"vol={event.volume} liq={event.liquidity} url={event.url}"
+                                    f"[{utc_now()}] discovery found no eligible weather events "
+                                    f"(discovery={discovery_seconds:.3f}s)"
                                 )
-                            websocket_seconds = await self.refresh_price_cache_for_events(client, events)
+                            else:
+                                print(
+                                    f"[{utc_now()}] monitoring {len(events)} weather event(s) "
+                                    f"(discovery={discovery_seconds:.3f}s):"
+                                )
+                                for event in events:
+                                    print(
+                                        f"  {event.city} {event.target_date} {event.station_id} "
+                                        f"vol={event.volume} liq={event.liquidity} url={event.url}"
+                                    )
+                                websocket_seconds = await self.refresh_price_cache_for_events(
+                                    client,
+                                    events,
+                                )
+                                print(
+                                    f"[{utc_now()}] websocket token refresh timing: "
+                                    f"{websocket_seconds:.3f}s"
+                                )
+                        except Exception as error:
+                            discovery_seconds = time.perf_counter() - discovery_started_at
                             print(
-                                f"[{utc_now()}] websocket token refresh timing: "
-                                f"{websocket_seconds:.3f}s"
+                                f"[{utc_now()}] ERROR discovery {type(error).__name__}: {error} "
+                                f"(discovery={discovery_seconds:.3f}s); keeping previous "
+                                f"{len(events)} event(s)"
                             )
                         if not source_announced:
                             decision = await choose_weather_source(
